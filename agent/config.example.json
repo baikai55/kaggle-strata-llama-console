@@ -1,0 +1,12 @@
+{
+  "exe": "/kaggle/working/Strata/build/strata",
+  "cwd": "/kaggle/working/Strata",
+  "tokenizer": "/kaggle/input/your-model/pack/tokenizer",
+  "model_name": "replace-with-your-prepared-model-name",
+  "arch": "qwen4exp",
+  "args": [
+    "--native", "/kaggle/input/your-model/pack",
+    "--max-context", "131072",
+    "--kv", "int8"
+  ]
+}

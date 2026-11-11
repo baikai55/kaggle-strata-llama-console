@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1018">
+  <meta name="color-scheme" content="dark">
+  <title>Strata Console · 算力管理</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <svg class="icon-library" aria-hidden="true"><defs>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+    <symbol id="i-chip" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v4m6-4v4M9 18v4m6-4v4M2 9h4m-4 6h4m12-6h4m-4 6h4"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M20 14a3 3 0 0 1-3 3H8l-5 4V6a3 3 0 0 1 3-3h11a3 3 0 0 1 3 3Z"/><path d="M7 8h9M7 12h6"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="9" r="5"/><path d="m12 13 8 8m-4-4 3-3m-6 0 3-3"/></symbol>
+    <symbol id="i-lines" viewBox="0 0 24 24"><path d="M9 5h12M9 12h12M9 19h12"/><path d="M3 5h1m-1 7h1m-1 7h1"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 6h16M4 18h16M4 12h16"/><circle cx="8" cy="6" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="18" r="2"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 6.1A8 8 0 0 1 20 12M4 12a8 8 0 0 0 13.9 5.9"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></symbol>
+    <symbol id="i-exit" viewBox="0 0 24 24"><path d="M9 4H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h4M9 12h12m-4-4 4 4-4 4"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="m10 13 4-4M8 15l-2 2a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0m4 2 2-2a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0" transform="translate(1 0)"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  </defs></svg>
+
+  <section id="auth-screen" class="auth-screen">
+    <div class="auth-story">
+      <div class="brand"><span class="brand-mark"><svg><use href="#i-chip"/></svg></span><span>strata<span class="brand-light">console</span></span></div>
+      <div class="auth-story-content"><span class="eyebrow">YOUR PRIVATE GPU WORKSPACE</span><h1>管理算力。<br>掌握每次推理。</h1><p>连接 Kaggle，观察 GPU 和模型状态，<br>从同一个入口管理你的私有模型服务。</p><div class="auth-illustration" aria-hidden="true"><div class="illustration-line"></div><div class="illustration-core"><svg><use href="#i-chip"/></svg></div><span class="illustration-tag">GPU</span><span class="illustration-tag secondary">STRATA</span></div></div>
+      <p class="auth-footnote">管理登录与模型 API Key 相互独立</p>
+    </div>
+    <div class="auth-form-side">
+      <form id="auth-form" class="auth-card">
+        <span class="eyebrow" id="auth-eyebrow">PRIVATE WORKSPACE</span>
+        <h2 id="auth-title">正在连接控制台</h2>
+        <p id="auth-description" class="muted">检查登录状态，请稍候。</p>
+        <div id="auth-fields" hidden>
+          <label id="setup-token-field" hidden>一次性设置令牌<input id="setup-token" type="password" autocomplete="off" placeholder="由部署者提供"></label>
+          <label>用户名<input id="auth-username" autocomplete="username" required maxlength="64" placeholder="输入管理用户名"></label>
+          <label>密码<input id="auth-password" type="password" autocomplete="current-password" required placeholder="输入管理密码"></label>
+          <button id="auth-submit" type="submit" class="button primary full">进入工作空间<svg><use href="#i-arrow"/></svg></button>
+        </div>
+        <p id="auth-error" class="form-error" role="alert"></p>
+        <button id="auth-retry" type="button" class="button full" hidden>重新连接</button>
+        <p class="auth-help">只有登录后的管理员可以更改配置、管理密钥和发送控制命令。</p>
+      </form>
+    </div>
+  </section>
+
+  <div id="app-shell" class="app-shell" hidden>
+    <aside id="sidebar" class="sidebar">
+      <a class="brand" href="#overview" aria-label="Strata Console 总览"><span class="brand-mark"><svg><use href="#i-chip"/></svg></span><span>strata<span class="brand-light">console</span></span></a>
+      <div class="workspace-label"><span class="workspace-avatar">K</span><div><strong>私有算力工作空间</strong><small>Kaggle · Strata</small></div></div>
+      <p class="nav-label">工作空间</p>
+      <nav aria-label="控制台导航">
+        <button class="nav-item active" data-view="overview"><svg><use href="#i-grid"/></svg><span>算力总览</span></button>
+        <button class="nav-item" data-view="models"><svg><use href="#i-chip"/></svg><span>模型与会话</span></button>
+        <button class="nav-item" data-view="chat"><svg><use href="#i-chat"/></svg><span>对话测试</span></button>
+        <button class="nav-item" data-view="keys"><svg><use href="#i-key"/></svg><span>API 访问</span></button>
+        <button class="nav-item" data-view="logs"><svg><use href="#i-lines"/></svg><span>运行日志</span></button>
+        <button class="nav-item" data-view="settings"><svg><use href="#i-settings"/></svg><span>连接设置</span></button>
+      </nav>
+      <div class="sidebar-bottom"><div class="server-indicator"><span id="server-dot" class="status-dot"></span><div><strong id="server-state">连接中</strong><small id="server-detail">等待服务器响应</small></div></div><button id="logout-button" class="account-button"><span id="username-label">管理员</span><svg><use href="#i-exit"/></svg><span class="sr-only">退出登录</span></button></div>
+    </aside>
+    <div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
+    <main class="main-content">
+      <header class="topbar"><div class="topbar-left"><button id="menu-button" class="icon-button mobile-menu" aria-label="打开导航" aria-expanded="false"><svg><use href="#i-menu"/></svg></button><span class="breadcrumb">工作空间 <span>/</span> <strong id="breadcrumb-current">算力总览</strong></span></div><div class="topbar-actions"><span id="connection-badge" class="badge neutral"><span class="status-dot"></span>Kaggle 待接入</span><button id="refresh-button" class="icon-button" aria-label="刷新状态" title="刷新状态"><svg><use href="#i-refresh"/></svg></button></div></header>
+      <div class="page-content">
+        <section class="view active" id="view-overview" aria-labelledby="overview-title">
+          <div class="page-heading"><div><span class="eyebrow">WORKSPACE OVERVIEW</span><h1 id="overview-title">算力总览</h1><p>模型、资源与会话，一眼掌握。</p></div><span id="updated-at" class="last-updated">等待首次同步</span></div>
+          <div id="onboarding-panel" class="onboarding-panel"><div class="onboarding-icon"><svg><use href="#i-link"/></svg></div><div><h3>Kaggle 还没有连接</h3><p>填写 Cloudflare 访问地址，下载接入 Notebook，在 Kaggle 中启用 GPU 并运行。</p></div><button class="button primary" data-open-view="settings">开始接入<svg><use href="#i-arrow"/></svg></button></div>
+          <div class="metric-grid">
+            <article class="metric-card"><div class="metric-label">推理模型<svg><use href="#i-chip"/></svg></div><strong id="metric-model" class="metric-value model-value">尚未加载</strong><span id="metric-model-detail" class="metric-note">连接后显示真实模型</span></article>
+            <article class="metric-card"><div class="metric-label">GPU 显存使用<svg><use href="#i-grid"/></svg></div><strong class="metric-value"><span id="metric-vram">—</span><small id="metric-vram-unit"></small></strong><span id="metric-vram-detail" class="metric-note">等待 GPU 遥测</span></article>
+            <article class="metric-card"><div class="metric-label">上下文配置<svg><use href="#i-chat"/></svg></div><strong class="metric-value"><span id="metric-context">—</span><small>tokens</small></strong><span id="metric-context-detail" class="metric-note">目标配置，非当前占用</span></article>
+            <article class="metric-card"><div class="metric-label">会话运行时长<svg><use href="#i-clock"/></svg></div><strong id="metric-runtime" class="metric-value">—</strong><span id="metric-runtime-detail" class="metric-note">Kaggle 会话尚未连接</span></article>
+          </div>
+          <div class="overview-grid">
+            <article class="panel gpu-panel"><div class="panel-heading"><div><h2>GPU 资源</h2><p>最近同步的设备状态</p></div><span id="gpu-count" class="badge neutral">无设备</span></div><div id="gpu-cards" class="gpu-cards"><div class="empty-state compact"><svg><use href="#i-chip"/></svg><h3>等待 GPU 数据</h3><p>代理连接后，这里会显示实际显存、利用率和温度。</p></div></div></article>
+            <article class="panel"><div class="panel-heading"><div><h2>资源趋势</h2><p>当前页面在线期间的真实采样</p></div></div><div class="chart-legend"><span><i class="legend-dot gpu"></i>GPU 平均利用率</span><span><i class="legend-dot ram"></i>系统内存使用率</span></div><div class="chart-wrap"><canvas id="resource-chart" aria-label="GPU 和系统内存使用率趋势"></canvas><div id="chart-empty" class="chart-empty">等待采样数据</div></div><div class="chart-footer"><span id="chart-range">尚无历史</span><span>0—100%</span></div><div class="ram-summary"><span>系统内存</span><strong id="ram-summary">—</strong></div><div class="progress-track"><div id="ram-progress" class="progress-fill secondary"></div></div></article>
+            <article class="panel activity-panel"><div class="panel-heading"><div><h2>最近任务</h2><p>请求执行与模型操作</p></div><button class="text-button" data-open-view="chat">对话测试<svg><use href="#i-arrow"/></svg></button></div><div id="recent-jobs" class="activity-list"><div class="empty-state compact"><p>还没有任务记录</p></div></div></article>
+            <article class="panel api-preview"><span class="eyebrow">PRIVATE INFERENCE API</span><h2>你的模型，一个接口。</h2><p>兼容 OpenAI 的调用方式。创建独立 API Key 后，将访问地址填入你的客户端。</p><div class="endpoint-display"><code id="overview-endpoint">配置访问地址后显示</code><button class="icon-button" data-copy-target="overview-endpoint" aria-label="复制 API 地址"><svg><use href="#i-copy"/></svg></button></div><button class="button" data-open-view="keys">管理 API 访问<svg><use href="#i-arrow"/></svg></button><small>模型离线时，接口会返回明确错误。</small></article>
+          </div>
+        </section>
+
+        <section class="view" id="view-models" aria-labelledby="models-title" hidden>
+          <div class="page-heading"><div><span class="eyebrow">MODEL & SESSION</span><h1 id="models-title">模型与会话</h1><p>配置模型启动参数，管理已连接的推理进程。</p></div><span id="model-state" class="badge neutral">未连接</span></div>
+          <div class="two-column-grid"><article class="panel"><div class="panel-heading"><div><h2>启动配置</h2><p>保存配置后，在 Kaggle 会话中加载模型。</p></div></div><form id="model-form" class="form-grid"><label class="full-width">已准备的 Strata 配置路径<input name="model_path" type="text" placeholder="/kaggle/input/你的模型数据集/strata-model.json" required><small>填写 Strata prepare 生成的 strata-*.json，模型及 pack 使用持久数据集保存。</small></label><label class="full-width">Strata 程序路径<input name="strata_path" type="text" placeholder="/kaggle/working/Strata"></label><label>上下文长度<input name="context_length" type="number" min="1024" max="1048576" step="1024" required><small>输入、历史与输出共同占用。</small></label><label>KV 缓存精度<select name="kv_type"><option value="int8">INT8</option><option value="q4_0">Q4_0</option><option value="k8v4">K8 / V4</option><option value="fp16">FP16</option></select></label><label class="toggle-row full-width"><span><strong>低内存模式</strong><small>减少显存与主内存中的重复专家存储。</small></span><input name="low_ram" type="checkbox" role="switch"></label><label class="toggle-row full-width"><span><strong>实验性去拒答投影</strong><small>适用的原模型可加载控制向量；可能改变普通回答。</small></span><input name="experimental_projection" type="checkbox" role="switch"></label><div class="form-actions full-width"><button class="button primary" type="submit">保存启动配置</button><span id="model-save-status" class="inline-status" role="status"></span></div></form></article><div class="panel-stack"><article class="panel"><div class="panel-heading"><div><h2>会话操作</h2><p>命令只发送给已连接的 Kaggle 代理。</p></div></div><div class="session-info"><span>当前模型</span><strong id="session-model">尚未加载</strong><span>代理最后同步</span><strong id="session-last-seen">—</strong></div><div class="session-actions"><button id="load-model-button" class="button primary full" data-agent-action="load_model" disabled>加载模型</button><button id="stop-model-button" class="button full" data-agent-action="stop_model" disabled>停止推理进程</button><button id="shutdown-button" class="button danger full" data-agent-action="shutdown" disabled>结束代理会话</button></div><p class="small muted">操作按队列执行。结束代理后仍需在 Kaggle 中停止会话，释放 GPU 配额；再次使用时重新运行 Notebook。</p><div id="command-result" class="inline-status" role="status"></div></article><article class="panel"><div class="panel-heading"><div><h2>接入文件</h2><p>在 Kaggle 中运行生成的 Notebook。</p></div></div><a class="button full download-notebook" href="/api/notebook"><svg><use href="#i-download"/></svg>下载 Kaggle Notebook</a><a class="button full secondary-download" href="/api/agent-download"><svg><use href="#i-download"/></svg>下载代理脚本</a><p class="small muted">Notebook 从 Kaggle Secrets 读取代理凭据。请下载凭据并保存为 STRATA_WORKER_KEY。</p></article></div></div>
+        </section>
+
+        <section class="view" id="view-chat" aria-labelledby="chat-title" hidden>
+          <div class="page-heading"><div><span class="eyebrow">INFERENCE PLAYGROUND</span><h1 id="chat-title">对话测试</h1><p>测试当前模型的真实回答与 token 使用情况。</p></div><button id="clear-chat-button" class="button">清空本页对话</button></div>
+          <div class="chat-layout"><article class="panel chat-panel"><div class="chat-panel-heading"><span id="chat-model-label">模型尚未就绪</span><span id="chat-state" class="badge neutral">待连接</span></div><div id="chat-messages" class="chat-messages" aria-live="polite"><div id="chat-welcome" class="chat-welcome"><span class="chat-welcome-icon"><svg><use href="#i-chat"/></svg></span><h2>从一个问题开始</h2><p>连接并加载模型后，可在这里测试中文回答、代码与长文档。<br>对话仅保留在当前页面，刷新后清空。</p></div></div><form id="chat-form" class="chat-composer"><label class="sr-only" for="chat-input">发送给模型的消息</label><textarea id="chat-input" rows="3" placeholder="输入你的问题…  Ctrl / ⌘ + Enter 发送" required maxlength="600000"></textarea><div class="composer-bottom"><span id="chat-request-status" class="small muted">等待模型就绪</span><button id="chat-send-button" type="submit" class="button primary" disabled>发送<svg><use href="#i-arrow"/></svg></button></div></form></article><aside class="panel chat-options"><h2>生成参数</h2><label>最大输出 tokens<input id="chat-max-tokens" type="number" value="512" min="1" max="32768"></label><label>Temperature<input id="chat-temperature" type="number" value="0.6" min="0" max="2" step="0.1"></label><div class="usage-panel"><span class="eyebrow">LAST RESPONSE USAGE</span><div><span>输入</span><strong id="usage-prompt">—</strong></div><div><span>输出</span><strong id="usage-completion">—</strong></div><div><span>总计</span><strong id="usage-total">—</strong></div><small>仅展示模型实际返回的用量，不估算未报告的数据。</small></div><p class="small muted">完整历史随每次请求发送。长材料和工具结果会占用上下文；缓存复用不会扩大窗口。</p></aside></div>
+        </section>
+
+        <section class="view" id="view-keys" aria-labelledby="keys-title" hidden>
+          <div class="page-heading"><div><span class="eyebrow">API ACCESS</span><h1 id="keys-title">API 访问</h1><p>为自己的应用创建独立密钥。</p></div></div>
+          <article class="panel api-connection-panel"><div><h2>OpenAI 兼容接口</h2><p>客户端填写 Base URL 和 API Key；管理网站的登录密码不用于模型调用。</p></div><div class="endpoint-display"><code id="api-base-url">配置访问地址后显示</code><button class="icon-button" data-copy-target="api-base-url" aria-label="复制 Base URL"><svg><use href="#i-copy"/></svg></button></div><div class="api-example"><div class="code-heading"><span>Python 调用示例</span><button class="text-button" data-copy-target="api-example-code">复制<svg><use href="#i-copy"/></svg></button></div><pre><code id="api-example-code"></code></pre></div></article>
+          <article class="panel"><div class="panel-heading"><div><h2>访问密钥</h2><p>完整密钥仅在创建时显示一次。</p></div><span id="key-count" class="badge neutral">0 个密钥</span></div><form id="key-form" class="key-create-form"><label class="sr-only" for="key-name">密钥名称</label><input id="key-name" required maxlength="80" placeholder="密钥名称，例如：个人客户端"><button class="button primary" type="submit">创建 Key</button></form><div id="new-key-panel" class="new-key-panel" hidden><div><strong>请立即保存这枚密钥</strong><p>关闭此提示后，无法再次查看完整内容。</p></div><div class="endpoint-display"><code id="new-key-value"></code><button class="icon-button" data-copy-target="new-key-value" aria-label="复制新密钥"><svg><use href="#i-copy"/></svg></button></div><button id="dismiss-key-button" class="text-button">我已保存，隐藏密钥</button></div><div class="table-scroll"><table class="data-table"><thead><tr><th>名称</th><th>密钥前缀</th><th>创建时间</th><th>最近使用</th><th>操作</th></tr></thead><tbody id="keys-table-body"><tr><td colspan="5" class="table-empty">暂无 API Key</td></tr></tbody></table></div><p id="keys-error" class="form-error" role="alert"></p></article>
+        </section>
+
+        <section class="view" id="view-logs" aria-labelledby="logs-title" hidden>
+          <div class="page-heading"><div><span class="eyebrow">RUNTIME LOGS</span><h1 id="logs-title">运行日志</h1><p>查看代理接入、推理任务和模型启动的真实记录。</p></div><button id="logs-refresh-button" class="button"><svg><use href="#i-refresh"/></svg>刷新日志</button></div><article class="panel"><div class="log-toolbar"><label class="sr-only" for="log-filter">日志筛选</label><input id="log-filter" placeholder="筛选消息、等级或时间"><span id="log-count" class="small muted">0 条记录</span></div><div id="log-lines" class="log-lines" role="log"><div class="empty-state"><svg><use href="#i-lines"/></svg><h3>暂无运行日志</h3><p>连接代理或发送任务后，记录会出现在这里。</p></div></div></article>
+        </section>
+
+        <section class="view" id="view-settings" aria-labelledby="settings-title" hidden>
+          <div class="page-heading"><div><span class="eyebrow">WORKSPACE SETTINGS</span><h1 id="settings-title">连接设置</h1><p>配置访问地址，并将 Kaggle 接入工作空间。</p></div></div><div class="two-column-grid"><article class="panel"><div class="panel-heading"><div><h2>外网访问地址</h2><p>填写 Cloudflare Tunnel 配置完成后的 HTTPS 地址。</p></div></div><form id="settings-form" class="form-grid"><label class="full-width">控制台 Public URL<input name="public_url" type="url" placeholder="https://你的访问域名" required><small>Kaggle 代理通过这个地址主动连接服务器。</small></label><div class="form-actions full-width"><button type="submit" class="button primary">保存连接地址</button><span id="settings-save-status" class="inline-status" role="status"></span></div></form><div class="setting-note"><svg><use href="#i-link"/></svg><p>Cloudflare Tunnel 指向服务器的本机监听端口。请保持登录保护，并只在私有 Notebook 中保存代理凭据。</p></div></article><article class="panel"><div class="panel-heading"><div><h2>Kaggle 接入</h2><p>模型在 Kaggle 推理，服务器负责管理和请求转发。</p></div></div><ol class="steps-list"><li><span>01</span><div><strong>准备私有模型数据集</strong><p>模型权重与 pack 文件保存到持久数据集。</p></div></li><li><span>02</span><div><strong>创建私有 Notebook</strong><p>启用 Internet 和 T4 ×2，将模型数据集添加为输入。</p></div></li><li><span>03</span><div><strong>导入接入 Notebook 并运行</strong><p>代理上线后，资源状态会自动更新。</p></div></li></ol><a class="button primary full download-notebook" href="/api/notebook"><svg><use href="#i-download"/></svg>下载接入 Notebook</a><a class="button full secondary-download" href="/api/worker-key">下载 Worker 凭据</a><button id="bootstrap-button" class="button full">查看接入信息</button><div id="bootstrap-result" class="bootstrap-result" hidden></div><p class="small muted">将代理凭据保存到 Kaggle Secrets，并允许该 Notebook 使用。代理在线后，再检查驱动和模型文件。</p></article></div><article class="panel server-panel"><div class="panel-heading"><div><h2>服务器状态</h2><p>管理服务自身的运行信息</p></div></div><dl id="server-info" class="server-info"><div><dt>状态</dt><dd>等待同步</dd></div></dl></article>
+        </section>
+      </div>
+      <footer class="page-footer"><span>STRATA CONSOLE <span class="footer-separator">/</span> 私有模型工作空间</span><span>按需启用 · 用完关闭</span></footer>
+    </main>
+  </div>
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+  <dialog id="confirm-dialog" class="confirm-dialog"><form method="dialog"><h2 id="confirm-title">确认操作</h2><p id="confirm-description"></p><div class="form-actions"><button value="cancel" class="button">取消</button><button id="confirm-proceed" value="confirm" class="button danger">确认</button></div></form></dialog>
+</body>
+</html>

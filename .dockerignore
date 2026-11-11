@@ -1,0 +1,12 @@
+.git
+.venv
+work
+data
+tests
+docs
+**/__pycache__
+.pytest_cache
+.env
+*.sqlite*
+*.log
+deploy/credentials*

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+data/
+work/
+deploy/credentials*
+*.sqlite*
+*.log
