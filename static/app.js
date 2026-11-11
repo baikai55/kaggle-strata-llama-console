@@ -213,7 +213,7 @@ for chunk in response:
     text('#api-example-code', example);
   }
   async function refreshStatus() {
-    if (!state.authenticated || state.pollBusy || document.hidden) return;
+    if (!state.authenticated || state.pollBusy) return;
     state.pollBusy = true;
     $('#refresh-button').classList.add('refreshing');
     try {
@@ -237,7 +237,7 @@ for chunk in response:
       $('#server-dot').className = 'status-dot bad';
       text('#server-state', '连接中断');
       text('#server-detail', error.message);
-      setBadge('#connection-badge', '状态同步失败', 'bad');
+      ['#connection-badge', '#model-state', '#chat-state'].forEach(function (selector) { setBadge(selector, '状态同步失败', 'bad'); });
       if (state.status) text('#updated-at', '数据已过期 · 等待重连');
       else text('#updated-at', '同步失败 · 等待重连');
     } finally {
