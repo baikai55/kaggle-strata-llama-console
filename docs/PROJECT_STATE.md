@@ -1,6 +1,55 @@
 # 项目状态
 
-更新：2026-11-13，Asia/Hong_Kong。
+更新：2026-11-14，Asia/Hong_Kong。
+
+## 本轮 0.7.2：修复 Agent 流式交付限速（2026-11-14）
+
+- `0.7.1` 无投影 Ornith 的正式 400-token 长输出中，llama.cpp 原始 `timings` 为约 67 tok/s，公开链路交付约 41.7 tok/s；但用户真实 Agent 请求仍只有 4.29–4.84 tok/s。逐请求核对最终 SSE 后确认模型本身分别为 55.32、60.84、67.34 tok/s，低速发生在 Worker 上传原始 chunk 的控制面。
+- 继续回查 `0.7.0` 含 mmproj 的 693-token 请求 `77b40e1c…`：保存的最终 SSE 为 `predicted_n=693`、`predicted_ms=10308.937`，即 llama.cpp 原始 decode 67.126 tok/s；148.994 秒总墙钟对应的 4.648 tok/s 同样是逐 token POST 的交付速度。因此视觉投影并未导致此前观测到的 15 倍 decode 下降。
+- 根因是 `stream_chat()` 在同步上传批次前记录时间，上传约 0.21 秒后仍用旧时间作为下一批起点；它超过 0.2 秒 flush 阈值，使下一 token 立刻再次单独 POST，形成稳定的“每 token 一个 Oracle 请求”反馈循环。修复后从上传完成时重新开始批次窗口，并增加模拟慢上传的 `[1, 9]` 回归测试。
+- 请求监控从最终 llama.cpp SSE `timings.predicted_n/predicted_ms` 记录真实模型 decode，同时保留首批到完成的流式交付速度；旧 Worker 丢弃 accumulator timings 时可从已保存的最后批次兼容提取。页面不再把控制面交付耗时标成模型 decode。
+- 手动 Worker 默认空闲退出由 5 分钟改为 8 分钟；托管 Runtime 仍使用最长 3 小时。新增 `ornith_35b_a3b_vision` 固定预设，与高速文本预设共用同一模型，但自动校验并加载原仓库同 commit 的固定 mmproj。逐 token POST 同样会拖慢识图答案的文字交付，但不会降低识图准确性，也不会影响首 token 前的图片编码与视觉 prefill。
+- 本地全量回归为 `100 passed`；Python compileall、`node --check static/app.js` 与 `git diff --check` 通过。
+- `0.7.2` 已部署到 Oracle，stamp `20261114T054253`；容器 healthy，SQLite integrity 为 ok，原数据卷、1 个管理员、1 个会话、4 个 API Key、设置、45 个其他容器和 `kaggle-adapter.service` 均保持不变。回滚镜像为 `kaggle-strata-console:before-20261114t054253`。
+- 新托管 Runtime operation `41741ce2…` 从提交到视觉模型 ready 约 101.5 秒，其中新 Worker 连接到模型 ready 约 84.2 秒；心跳为 `preset=ornith_35b_a3b_vision`、`vision=true`、128K、Q8_0、双卡 `1,1`。
+- 同一视觉进程的 400-token 纯文本验收：41-token prompt、`predicted_n=400`、`predicted_ms=5960.456`，监控 decode 67.11 tok/s、交付 71.44 tok/s；Worker 只上传 14 批 `[1,32,32,32,32,32,32,31,32,30,32,30,32,20]`，不再逐 token POST。
+- 真图片验收使用 64×64 左红右蓝 PNG，回答“图片左半部分是红色，右半部分是蓝色”；总耗时 4.324 秒、TTFT 1.95 秒、`predicted_n=75`、`predicted_ms=1063.149`，监控 decode 70.55 tok/s、交付 78.31 tok/s，仅 4 批 `[1,32,32,9]`。当前视觉 Runtime 保持在线供 Agent 工具调用继续测试。
+
+## 本轮 0.7.1：Ornith 文本性能与真实 TPS（2026-11-14）
+
+- `0.7.0` 已部署并完成正式 Runtime、真实工具调用闭环及 Qwen ↔ Ornith 双向切换。Ornith 含 mmproj 的正式进程随后测得纯文本 36-token prompt / 693-token output：首事件 0.125 秒、总计 148.994 秒；当时按端到端墙钟误标为 decode 4.648 tok/s，0.7.2 后确认该值实际是控制面流式交付速度。
+- 独立 smoke 的 70.717 tok/s 并非 `llama-bench`：它使用同一份 `llama-server`、同一 `prepare_llama` 参数和真实 `/v1/chat/completions` SSE，500-token prompt、200-token output、temperature 0、ignore_eos；唯一主动删除的是 `--mmproj`。因此 `0.7.1` 让 Ornith 默认不附加投影，Qwen 保持视觉；Ornith 显式高级路径仍可校验并加载固定 mmproj。
+- 请求监控新增 `started_at` / `first_token_at` 兼容迁移，并初步以 `(completion_tokens-1)/首批到完成墙钟时间` 展示速度；后续 0.7.2 证明该值实际包含 Worker 控制面交付时间，不等同 llama.cpp decode。不保存消息正文。托管 Runtime 显式使用最长 3 小时空闲上限，手动 Notebook 当时仍为 5 分钟。
+- 本地全量回归为 `99 passed`；Python compileall、`node --check static/app.js` 与 `git diff --check` 通过。下一步部署 0.7.1，启动无投影 Ornith，用同一正式 API 长输出复测 decode，并验证相同长 prompt 的缓存命中。
+
+## 本轮 0.7.0：Ornith 双模型切换（已部署并完成真机验收，2026-11-14）
+
+- 管理面板与后端已完成 `qwen38_27b` / `ornith_35b_a3b` 两套固定 llama.cpp 预设：保存目标预设后可原子切换，切换任务一旦排队即拒绝新聊天；目标为 Strata 时仍要求先显式停止当前 llama.cpp 模型，避免隐式停止后加载失败。
+- Kaggle Runtime 固定挂载 `job579/qwen3-8-27b-unsloth-q4-runtime` 与 `job579/ornith-1-5-35b-a3b-q4-runtime`。现有 llama.cpp commit `93cf736a8d1d46aa922e27eb64aa712bcd5ebc30` 已确认包含 `qwen35moe` 架构和 35B-A3B 实现；具体 Ornith GGUF 仍以双 T4 smoke 为准。
+- 私有 Dataset `job579/ornith-1-5-35b-a3b-q4-runtime` 已完成，保持 Private，包含固定 commit 的 `Ornith-1.5-35B-Q4_K_M.gguf`（21,713,463,040 bytes）、`mmproj-Ornith-1.5-35B-BF16.gguf`（902,822,240 bytes）及 487-byte `ornith-cache-manifest.json`。临时受限 relay 完整发送两个 GGUF，失败和取消均为 0；CLI 从最新版本独立核对了三个文件名与大小。
+- 独立私有 Commit Run [Ornith 1.5 35B A3B Smoke 2026-11-14](https://www.kaggle.com/code/job579/ornith-1-5-35b-a3b-smoke-2026-11-14) Version 3 使用双 T4、128K context、Q8 KV、`1,1` layer split、纯文本完成验收：模型 101.196 秒 ready；512-token prompt 的 TTFT 1.211 秒、prefill 424.36 tok/s；200-token 输出 70.717 tok/s；双卡峰值 11,403 / 10,881 MiB。benchmark 阶段只读 4 KiB，随后静置 30 秒的磁盘读取和 major fault 增量均为 0；主模型与 mmproj 完整 SHA-256 均匹配。
+- Smoke Version 1/2 已经成功加载同一模型，但测试脚本使用 `requests.iter_lines()` 时把模型输出中的 Unicode line separator 当成了 SSE 换行，导致 JSON 事件截断；Version 3 改为只按 wire LF byte 拆分后通过。这不是模型失败，同时暴露了生产 Worker 流解析需要采用相同修复。
+- `0.7.0` 已部署到 Oracle，SSE wire-LF 修复生效；正式 Runtime 约 2 分 32 秒进入 Ornith ready。管理面板短答、公开 API 规范 tool_calls、工具结果回传以及 Ornith → Qwen → Ornith 双向切换均成功。随后看到含 mmproj 的正式 Ornith 端到端交付只有约 4.65 tok/s；0.7.2 最终定位为 Worker 批次计时反馈循环，而非已经证实的 mmproj decode 回退。
+
+## 本轮 IQ3_XXS Strata Smoke 结论与 Ornith 后继方案（2026-11-14）
+
+- 独立私有 Commit Run [IQ3 XXS Strata Smoke 2026-11-14](https://www.kaggle.com/code/job579/iq3-xxs-strata-smoke-2026-11-14) 最终以 Version 3 完成有效验收；生产 `llama.cpp + Qwen3.8-27B + mmproj`、固定 Runtime 与 Oracle 0.6.0 均未修改。Version 1/2 只暴露 Kaggle Conda Python 3.13 缺 `ensurepip` 的准备脚本兼容问题；Version 3 显式使用系统 Python 3.12 建立 venv 并直接运行 `setup.py`，三个 Python/venv/pip probe 全部通过。
+- 有效配置为双 T4、8K context、INT8 KV、无视觉、无 MTP、`--expert-cache 1024 --mmap-experts --ple-io mmap --vram-reserve-mib 1024 --pcie-frac 0 --spec 4`、`STRATA_FILL_AHEAD=0`。准备耗时 124.100 秒，引擎等待 1178.623 秒，总耗时 1302.992 秒；结果为 `not_ready`，没有进入推理，也没有模型回答。
+- 引擎已完成 1466 MiB pack（0.4 秒）、300 个 native projection（1781.11 MiB，39.2 秒）、双卡 layer split、PLE mmap 与 1539-slot / 2.22 GiB 专家缓存；专家缓存 1539/1539 预填耗时 282.5 秒、约 8 MB/s。随后日志停在 `layer split, CUDA1: 10.49 GiB free`，约 15 分钟没有新进展，最终由 1170 秒 READY 上限退出。
+- 没有 OOM、`Killed/-9` 或显存分配失败：memory guard 为 30.0 GiB，记录 current 12.9 GiB、available 27.6 GiB；结束后两张 T4 均为 0 MiB。结论不是“模型塞不下”，而是当前 Strata v0.2.13 / engine 0.1.59、双 T4 和 Kaggle Input mmap 路径在缓存填满后仍无法 READY；已经触达 20 分钟止损线，不再原样加时复测 IQ3_XXS。
+- 用户后继首选为官方 `ornith-ai/Ornith-1.5-35B-A3B-GGUF` 的 `Q4_K_M`：架构 `qwen35moe`，GGUF 总参数 35,505,251,456，context 262,144，MIT；主文件精确 21,713,463,040 bytes，官方 BF16 视觉投影精确 902,822,240 bytes。该路线改回现有 llama.cpp 后端，不依赖 Strata；速度与质量仍须在双 T4 上实测，不能把社区 40–90 tok/s 预测当成验收结果。
+- 已按用户要求永久删除旧私有 Dataset `job579/rvn-qwen3-8-flash-next-strata-iq3s`，删除文件精确 88,882,765,184 bytes，CLI 复查为 `No datasets found`；重新使用只能再次上传。当前保留 IQ3_XXS 75,839,998,528 bytes 与生产 Runtime 17,585,773,576 bytes，合计 93,425,772,104 bytes；再加入 Ornith Q4 与 mmproj 后约 116,042,057,384 bytes，低于 200 GB 私有 Dataset 上限约 84 GB。
+- Smoke 终态为 Kaggle `COMPLETE`，两张 T4 均已释放；Oracle 容器中的任务专用 output 目录和提交临时目录均已清理，任务专用 SSH 代理 PID `43368` 已停止，`127.0.0.1:18791` 无监听。
+
+## 本轮 RVN Strata 受控复测与 IQ3_XXS 后继方案（独立试验，2026-11-13）
+
+- 独立私有 Commit Run [RVN Strata Retry 2026-11-13](https://www.kaggle.com/code/job579/rvn-strata-retry-2026-11-13) 使用原 `job579/rvn-qwen3-8-flash-next-strata-iq3s` Dataset、T4 ×2、8K context、Strata v0.2.13 / engine 0.1.59 复测；生产 `llama.cpp + Qwen3.8-27B + mmproj`、固定 Runtime 和 Oracle 0.6.0 均未修改。
+- 本次显式使用 `--expert-cache 3500 --mmap-experts --ple-io mmap --vram-reserve-mib 1024` 与 `STRATA_FILL_AHEAD=1024`。准备耗时 57.696 秒；引擎加载 904.481 秒后由 Strata 自身的 900 秒 READY 上限退出，结果为 `not_ready`，没有进入 64-token 短答，也没有任何成功模型回答。
+- 日志确认 PLE 和专家均走 mmap，300 个 native projection 共 1323.87 MiB、39.5 秒加载完成；双卡自动 layer split 后预测每个 decode window 60.5 ms，3500-slot 专家缓存占 7.59 GiB VRAM。最终仍停在 `PROFILE ... the profile fill asks for 1024 pairs ahead`，未出现 `pre-filled`、`READY`、服务 `ready:` 或 `/v1/status loaded:true`。
+- 未出现 `CUDA out of memory`、`cudaErrorMemoryAllocation`、weight arena 分配失败或进程 `Killed/-9`，因此本次仍不能归因于 OOM；直接结论是 RVN IQ3_S 在 Kaggle 约 31 GiB RAM 和当前 Input I/O 上无法满足 5 分钟启动目标，且 15 分钟内也未完成专家缓存填充，不应替换生产主线。
+- 下一档优先候选为 ISTA-DASLab `Qwen3.8-Flash-Next-GSQ-RCO IQ3_XXS`：主工作集约 47,039,860,096 bytes，另有可留在磁盘 mmap 的 28,800,138,432-byte PLE shard，基础下载共 75,839,998,528 bytes；双 16GB GPU + 32GB RAM 有同类运行案例。首次只做 8K/16K、INT8 KV、关闭视觉和 MTP、低 RAM mmap、多卡 layer split 的受控测试；若仍失败，直接降到约 37.6GB 工作集的 Q2_0，而非优先 IQ2_XS。
+- Kaggle 当时两个私有 Dataset 列表大小合计 104,974,856,435 bytes；加入 IQ3_XXS 基础文件后约 180,814,854,963 bytes。该阶段尚未删除 RVN Dataset；后续已于 2026-11-14 按实际文件大小 88,882,765,184 bytes 删除。当前 llama.cpp Dataset 始终保留。
+- Commit Run 完成后两张 T4 均为 0 MiB 使用，Kaggle 状态为 `COMPLETE`；Oracle 容器内临时下载目录已删除。任务专用 SSH 代理 PID `40900` 已停止，`127.0.0.1:18791` 无监听，仅残留正常的 TCP `TIME_WAIT`。
 
 ## 本轮 0.6.0：Qwen3.8 视觉投影与图片聊天（已部署并完成真机验收，2026-11-13）
 

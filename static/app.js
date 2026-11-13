@@ -6,6 +6,17 @@
   const labels = { overview: '算力总览', quotas: 'Kaggle 配额', models: '模型与会话', chat: '对话测试', keys: 'API 访问', requests: '请求监控', logs: '运行日志', settings: '连接设置' };
   const CHAT_IMAGE_LIMIT = 4;
   const CHAT_IMAGE_TOTAL_BYTES = 2 * 1024 * 1024;
+  const LLAMA_PRESETS = {
+    qwen38_27b: { label: 'Qwen3.8-27B', detail: '稳定 / 较慢' },
+    ornith_35b_a3b: { label: 'Ornith-1.5-35B-A3B', detail: 'MoE / 高速文本' },
+    ornith_35b_a3b_vision: { label: 'Ornith-1.5-35B-A3B', detail: 'MoE / 视觉' }
+  };
+  const mmprojInput = document.querySelector('input[name="llama_mmproj_path"]');
+  if (mmprojInput) {
+    mmprojInput.placeholder = '留空按预设决定';
+    const hint = mmprojInput.parentElement && mmprojInput.parentElement.querySelector('small');
+    if (hint) hint.textContent = 'Qwen 与 Ornith 视觉预设自动加载配套投影；高速 Ornith 不加载。';
+  }
   const state = { authenticated: false, setup: false, currentView: 'overview', status: null, runtime: null, settings: {}, history: [], chatImages: [], chatImageBusy: false, samples: [], logs: [], requests: { summary: {}, rows: [] }, quotas: null, requestPeriod: '7d', requestsBusy: false, quotasBusy: false, pollBusy: false, chatBusy: false, chatJob: null, commandBusy: false, runtimeBusy: false, pendingAuth: false, connectionFresh: false };
   const dirtyForms = new Set();
 
@@ -28,6 +39,11 @@
     if (n < 1000) return Math.round(n) + ' ms';
     if (n < 60000) return (n / 1000).toFixed(n < 10000 ? 2 : 1) + ' 秒';
     return formatDuration(n / 1000);
+  }
+  function formatTokensPerSecond(value) {
+    const n = safeNumber(value);
+    if (n === null) return '—';
+    return n.toLocaleString('zh-CN', { minimumFractionDigits: n < 10 ? 2 : 1, maximumFractionDigits: 2 }) + ' tok/s';
   }
   function formatMemory(mb) { const n = safeNumber(mb); return n === null ? '—' : (n / 1024).toFixed(1) + ' GiB'; }
   function formatDate(value, includeTime) {
@@ -116,7 +132,57 @@
   }
   function modelVisionReady() {
     const agent = state.status && state.status.agent;
-    return Boolean(modelReady() && agent && agent.model && typeof agent.model === 'object' && agent.model.vision === true);
+    return Boolean(modelCallable() && agent && agent.model && typeof agent.model === 'object' && agent.model.vision === true);
+  }
+  function presetLabel(value) {
+    const preset = LLAMA_PRESETS[value];
+    return preset ? preset.label + '（' + preset.detail + '）' : value || '未选择';
+  }
+  function selectedLlamaPreset() {
+    const form = $('#model-form');
+    const field = form && form.elements.namedItem('llama_preset');
+    if (field && field.value) return field.value;
+    return state.settings.llama_preset || 'qwen38_27b';
+  }
+  function loadedLlamaPreset() {
+    const agent = state.status && state.status.agent;
+    const model = agent && agent.model && typeof agent.model === 'object' ? agent.model : {};
+    const reported = model.preset || model.profile || model.llama_preset;
+    if (LLAMA_PRESETS[reported]) return reported;
+    const name = modelName(agent).toLowerCase();
+    if (name.includes('ornith')) return 'ornith_35b_a3b';
+    if (name.includes('qwen3.8') || name.includes('qwen3-8')) return 'qwen38_27b';
+    return '';
+  }
+  function modelCallable() {
+    if (!modelReady()) return false;
+    const selectedBackend = state.settings.backend || 'strata';
+    const agent = state.status && state.status.agent;
+    const model = agent && agent.model && typeof agent.model === 'object' ? agent.model : {};
+    const loadedBackend = String(model.backend || '').toLowerCase();
+    if (selectedBackend !== 'llama_cpp') {
+      // Older Strata workers did not report a backend, so an empty value is
+      // compatible only with Strata. A reported llama.cpp model must never be
+      // presented as callable after the saved target changes to Strata.
+      return !loadedBackend || loadedBackend === selectedBackend;
+    }
+    return loadedBackend === 'llama_cpp'
+      && loadedLlamaPreset() === (state.settings.llama_preset || 'qwen38_27b');
+  }
+  function modelTransitioning() {
+    const agent = state.status && state.status.agent;
+    const agentStatus = String(agent && agent.status || '').toLowerCase();
+    const modelStatus = String(agent && agent.model && typeof agent.model === 'object' && agent.model.status || '').toLowerCase();
+    const runtimeStatus = runtimeState(state.runtime || state.status && state.status.runtime);
+    return state.commandBusy || ['loading', 'starting', 'busy', 'stopping'].includes(agentStatus)
+      || ['loading', 'starting', 'stopping'].includes(modelStatus)
+      || ['loading_model', 'verifying_model'].includes(runtimeStatus);
+  }
+  function renderModelTarget() {
+    const backendField = $('#model-form') && $('#model-form').elements.namedItem('backend');
+    const backend = backendField && backendField.value || state.settings.backend || 'strata';
+    const unsaved = dirtyForms.has('model-form');
+    text('#session-target', backend === 'llama_cpp' ? presetLabel(selectedLlamaPreset()) + (unsaved ? ' · 未保存' : '') : 'Strata');
   }
   function runtimeState(runtime) { return String(runtime && runtime.state || (runtime && runtime.configured ? 'stopped' : 'unconfigured')).toLowerCase(); }
   function runtimeActive(runtime) { return ['queued_local', 'submitting', 'queued', 'pending', 'running', 'waiting_worker', 'unknown', 'loading_model', 'verifying_model', 'stop_requested', 'stopping'].includes(runtimeState(runtime)); }
@@ -134,6 +200,7 @@
       loading_model: ['正在加载模型', 'warn', 'Worker 已连接，正在加载当前模型配置。'],
       verifying_model: ['等待模型确认', 'warn', '加载命令已完成，正在等待 Worker 心跳确认模型可用。'],
       model_stopped: ['模型已停止', 'neutral', 'Worker 仍在线；再次点击加载模型即可恢复推理。'],
+      model_switch_required: ['等待切换模型', 'warn', '当前已加载模型与管理面板所选预设不同。'],
       ready: ['模型已就绪', 'good', '算力与模型均已就绪。'],
       stop_requested: ['正在结束运行', 'warn', '已请求 Worker 退出，等待 Kaggle 运行自然结束。'],
       stopping: ['正在结束运行', 'warn', '已请求 Worker 退出，等待 Kaggle 运行自然结束。'],
@@ -162,9 +229,9 @@
     const agentStatus = String(state.status && state.status.agent && state.status.agent.status || '').toLowerCase();
     const currentModelStatus = String(state.status && state.status.agent && state.status.agent.model && typeof state.status.agent.model === 'object' && state.status.agent.model.status || '').toLowerCase();
     const stopping = ['stop_requested', 'stopping'].includes(runtimeState(item)) || Boolean(item.stop_requested);
-    const authoritativeRuntimeState = ['failed', 'verifying_model', 'model_stopped'].includes(runtimeState(item));
+    const authoritativeRuntimeState = ['failed', 'verifying_model', 'model_stopped', 'model_switch_required'].includes(runtimeState(item));
     if (stopping || authoritativeRuntimeState) phase = runtimePhase(item);
-    else if (modelReady()) phase = ['模型已就绪', 'good', '算力与模型均已就绪，可以调用 API。'];
+    else if (modelCallable()) phase = ['模型已就绪', 'good', '算力与模型均已就绪，可以调用 API。'];
     else if (online && (['loading', 'starting'].includes(agentStatus) || ['loading', 'starting'].includes(currentModelStatus))) phase = ['正在加载模型', 'warn', 'Worker 已连接，正在加载当前模型配置。'];
     else if (online) phase = ['Worker 已连接', 'good', 'Worker 已上线，等待模型就绪。'];
     text('#runtime-state', phase[0] + (item.kernel_status ? ' · ' + item.kernel_status : ''));
@@ -187,11 +254,29 @@
     const agent = state.status && state.status.agent;
     const agentStatus = String(agent && agent.status || '').toLowerCase();
     const modelStatus = String(agent && agent.model && typeof agent.model === 'object' && agent.model.status || '').toLowerCase();
+    const transitioning = modelTransitioning();
+    const selectedPreset = selectedLlamaPreset();
+    const currentPreset = loadedLlamaPreset();
+    const backendField = $('#model-form') && $('#model-form').elements.namedItem('backend');
+    const selectedBackend = backendField && backendField.value || state.settings.backend || 'strata';
+    const modelFormDirty = dirtyForms.has('model-form');
     $$('[data-agent-action]').forEach(function (button) {
       const action = button.dataset.agentAction;
       let available = online;
-      if (action === 'load_model') available = online && !modelReady() && !['loading', 'starting', 'busy', 'stopping'].includes(agentStatus) && !['loading', 'starting', 'stopping'].includes(modelStatus);
-      if (action === 'stop_model') available = online && Boolean(modelStatus) && modelStatus !== 'stopped';
+      if (button.id === 'load-model-button') {
+        const switching = modelReady() && selectedBackend === 'llama_cpp';
+        button.dataset.agentAction = switching ? 'switch_model' : 'load_model';
+        if (modelFormDirty) button.textContent = '请先保存模型选择';
+        else if (modelReady() && selectedBackend !== 'llama_cpp') button.textContent = '切换 Strata 前请先停止当前模型';
+        else if (transitioning) button.textContent = switching ? '正在切换模型…' : '正在加载模型…';
+        else if (switching && currentPreset === selectedPreset) button.textContent = '已加载所选模型';
+        else button.textContent = switching ? '切换到所选模型' : '加载所选模型';
+        available = online && !modelFormDirty && !transitioning &&
+          (!modelReady() || (switching && currentPreset !== selectedPreset));
+      } else if (action === 'load_model' || action === 'switch_model') {
+        available = online && !modelFormDirty && !transitioning;
+      }
+      if (action === 'stop_model') available = online && !transitioning && Boolean(modelStatus) && modelStatus !== 'stopped';
       button.disabled = !available || state.commandBusy;
     });
     const runtime = state.runtime || {};
@@ -210,9 +295,10 @@
       setRuntimeButton(button, stoppedRequested ? '正在停止…' : '停止算力', state.runtimeBusy || stoppedRequested);
       button.disabled = state.runtimeBusy || stoppedRequested;
     });
-    $('#chat-send-button').disabled = !modelReady() || state.chatBusy;
-    $('#chat-image-button').disabled = !modelVisionReady() || state.chatBusy || state.chatImageBusy;
+    $('#chat-send-button').disabled = !modelCallable() || transitioning || state.chatBusy;
+    $('#chat-image-button').disabled = !modelVisionReady() || transitioning || state.chatBusy || state.chatImageBusy;
     $('#clear-chat-button').disabled = state.chatBusy;
+    renderModelTarget();
   }
   function showAuth(setup) {
     state.authenticated = false;
@@ -305,7 +391,7 @@
     const backend = state.settings.backend || 'strata';
     const context = safeNumber(backend === 'llama_cpp' ? state.settings.llama_context_length : state.settings.context_length);
     text('#metric-context', context === null ? '—' : formatNumber(context));
-    text('#metric-context-detail', (backend === 'llama_cpp' ? 'llama.cpp' : 'Strata') + ' 已保存配置');
+    text('#metric-context-detail', (backend === 'llama_cpp' ? 'llama.cpp · ' + presetLabel(state.settings.llama_preset || 'qwen38_27b') : 'Strata') + ' 已保存配置');
     const publicUrl = String(state.settings.public_url || '').replace(/\/+$/, '');
     const suppliedEndpoint = state.status && state.status.api_endpoint;
     const endpoint = suppliedEndpoint || (publicUrl ? publicUrl + '/v1' : '');
@@ -332,6 +418,7 @@ for chunk in response:
         print(chunk.choices[0].delta.content or "", end="")
 # 当前服务保持连接，等模型完成后一次返回内容。`;
     text('#api-example-code', example);
+    renderModelTarget();
   }
   async function refreshStatus() {
     if (!state.authenticated || state.pollBusy) return;
@@ -377,12 +464,13 @@ for chunk in response:
     const runtimeInfo = runtimePhase(runtime);
     const launching = !online && runtimeActive(runtime);
     const runtimeFailed = !online && runtimeState(runtime) === 'failed';
+    const switchRequired = online && runtimeState(runtime) === 'model_switch_required';
     const loading = ['loading', 'starting'].includes(status) || ['loading', 'starting'].includes(reportedModelStatus);
-    const label = launching ? runtimeInfo[0] : runtimeFailed ? '启动失败' : !online ? runtimeState(runtime) === 'stopped' ? '算力已停止' : 'Kaggle 离线' : loading ? '模型加载中' : status === 'error' ? '模型异常' : modelReady() ? '模型已就绪' : '代理在线';
-    const style = launching ? 'warn' : runtimeFailed ? 'bad' : !online ? 'neutral' : status === 'error' ? 'bad' : loading ? 'warn' : 'good';
+    const label = launching ? runtimeInfo[0] : runtimeFailed ? '启动失败' : !online ? runtimeState(runtime) === 'stopped' ? '算力已停止' : 'Kaggle 离线' : switchRequired ? '等待切换模型' : loading ? '模型加载中' : status === 'error' ? '模型异常' : modelReady() ? '模型已就绪' : '代理在线';
+    const style = launching ? 'warn' : runtimeFailed ? 'bad' : !online ? 'neutral' : status === 'error' ? 'bad' : switchRequired || loading ? 'warn' : 'good';
     setBadge('#connection-badge', label, style);
     setBadge('#model-state', label, style);
-    setBadge('#chat-state', modelReady() ? modelVisionReady() ? '文字 / 图片' : '可以发送文字' : label, modelReady() ? 'good' : style);
+    setBadge('#chat-state', modelCallable() ? modelVisionReady() ? '文字 / 图片' : '可以发送文字' : label, modelCallable() ? 'good' : style);
     text('#metric-model', name ? name.split('/').pop() : '尚未加载');
     $('#metric-model').title = name;
     const modelInfo = agent && agent.model && typeof agent.model === 'object' ? agent.model : {};
@@ -391,7 +479,8 @@ for chunk in response:
     const loadedContext = safeNumber(modelInfo.context);
     const modelDetail = [online ? label : name ? '上次模型 · 代理已离线' : '', backendLabel, modelInfo.vision === true ? '视觉已启用' : '', loadedContext === null ? '' : formatNumber(loadedContext) + ' tokens'].filter(Boolean).join(' · ');
     text('#metric-model-detail', name ? modelDetail : backendLabel ? '等待 ' + backendLabel + ' 加载' : '连接后显示真实模型');
-    text('#session-model', name ? name + (backendLabel ? ' · ' + backendLabel : '') + (modelInfo.vision === true ? ' · 视觉' : '') : '尚未加载');
+    const loadedPresetLabel = modelInfo.preset && LLAMA_PRESETS[modelInfo.preset] ? LLAMA_PRESETS[modelInfo.preset].label : '';
+    text('#session-model', name ? name + (loadedPresetLabel && !name.toLowerCase().includes(loadedPresetLabel.toLowerCase()) ? ' · ' + loadedPresetLabel : '') + (backendLabel ? ' · ' + backendLabel : '') + (modelInfo.vision === true ? ' · 视觉' : '') : '尚未加载');
     text('#chat-model-label', name ? name + (modelInfo.vision === true ? ' · 可识图' : ' · 仅文字') : '模型尚未就绪');
     text('#session-last-seen', agent && agent.last_seen ? formatDate(agent.last_seen, true) : '—');
     const launchElapsed = runtimeElapsed(runtime);
@@ -401,7 +490,7 @@ for chunk in response:
       text('#metric-context', formatNumber(loadedContext));
       text('#metric-context-detail', (backendLabel || '模型') + ' 实际加载窗口');
     }
-    if (!state.chatBusy) text('#chat-request-status', modelReady() ? modelVisionReady() ? '当前页对话 · 可发送文字或图片' : '当前模型未加载视觉投影，仅支持文字' : '连接并加载模型后即可发送');
+    if (!state.chatBusy) text('#chat-request-status', modelTransitioning() ? '模型正在加载或切换，请稍候' : modelCallable() ? modelVisionReady() ? '当前页对话 · 可发送文字或图片' : '当前模型未加载视觉投影，仅支持文字' : '连接并加载所选模型后即可发送');
     renderGpus(agent && agent.metrics, online);
     renderJobs(payload.recent_jobs || []);
     renderServer(payload.server || {});
@@ -502,7 +591,7 @@ for chunk in response:
     jobs.slice(0, 5).forEach(function (job) {
       const item = node('div', 'activity-item'), mark = node('span', 'activity-icon'), content = node('div');
       const action = job.action || job.type || '推理请求';
-      const actionLabels = { chat: '对话推理', completion: '对话推理', load_model: '加载模型', stop_model: '停止模型', shutdown: '结束代理' };
+      const actionLabels = { chat: '对话推理', completion: '对话推理', load_model: '加载模型', switch_model: '切换模型', stop_model: '停止模型', shutdown: '结束代理' };
       mark.append(icon(action === 'chat' || action === 'completion' ? 'chat' : 'chip'));
       content.append(node('strong', '', job.name || actionLabels[action] || action), node('small', '', formatDate(job.created_at || job.timestamp, true) + (job.id ? ' · ' + String(job.id).slice(0, 8) : '')));
       const status = jobStatus(job.status);
@@ -638,6 +727,8 @@ for chunk in response:
     const rate = safeNumber(summary.success_rate);
     text('#requests-success-rate', rate === null ? '—' : rate.toFixed(1) + '%');
     text('#requests-duration', formatRequestDuration(summary.avg_duration_ms));
+    text('#requests-ttft', formatRequestDuration(summary.avg_ttft_ms));
+    text('#requests-output-tps', formatTokensPerSecond(summary.avg_decode_tps ?? summary.avg_output_tps ?? summary.output_tps));
     text('#requests-total-tokens', formatCompactNumber(summary.total_tokens || 0));
     text('#requests-prompt-tokens', formatCompactNumber(summary.prompt_tokens || 0));
     text('#requests-completion-tokens', formatCompactNumber(summary.completion_tokens || 0));
@@ -646,7 +737,7 @@ for chunk in response:
     const body = $('#requests-table-body'); body.replaceChildren();
     if (!rows.length) {
       const row = node('tr'), cell = node('td', 'table-empty', '当前筛选范围内没有请求记录');
-      cell.colSpan = 8; row.append(cell); body.append(row); return;
+      cell.colSpan = 9; row.append(cell); body.append(row); return;
     }
     rows.forEach(function (item) {
       const row = node('tr'), source = requestSource(item), status = requestStatus(item.status);
@@ -659,13 +750,27 @@ for chunk in response:
       const statusCell = node('td');
       const badge = node('span', 'badge ' + status[1]); badge.append(node('span', 'status-dot'), document.createTextNode(status[0])); statusCell.append(badge);
       const duration = node('td', 'request-duration', formatRequestDuration(item.duration_ms));
+      const performance = node('td', 'request-performance');
+      performance.append(node('strong', '', formatTokensPerSecond(item.decode_tps ?? item.output_tps)));
+      const phases = [
+        ['排队', item.queue_ms],
+        ['TTFT', item.ttft_ms],
+        ['模型', item.decode_ms],
+        ['交付', item.delivery_ms ?? item.generation_ms]
+      ].filter(function (phase) { return safeNumber(phase[1]) !== null; });
+      if (phases.length) {
+        phases.forEach(function (phase) { performance.append(node('small', '', phase[0] + ' ' + formatRequestDuration(phase[1]))); });
+      } else {
+        performance.append(node('small', '', '旧记录无分段时序'));
+      }
+      if (safeNumber(item.delivery_tps) !== null) performance.append(node('small', '', '交付 ' + formatTokensPerSecond(item.delivery_tps)));
       const tokens = node('td', 'request-tokens');
       tokens.append(node('strong', '', formatCompactNumber(item.total_tokens || 0)), node('small', '', '↑ ' + formatCompactNumber(item.prompt_tokens || 0) + '  ↓ ' + formatCompactNumber(item.completion_tokens || 0)));
       const cached = node('td', 'request-cached', formatCompactNumber(item.cached_tokens || 0));
       const detail = node('td', 'request-detail');
       detail.append(node('code', '', String(item.job_id || '—').slice(0, 12)));
       if (item.error) detail.append(node('small', 'request-error', item.error));
-      row.append(when, origin, model, statusCell, duration, tokens, cached, detail); body.append(row);
+      row.append(when, origin, model, statusCell, duration, performance, tokens, cached, detail); body.append(row);
     });
   }
   async function refreshRequests() {
@@ -823,6 +928,7 @@ for chunk in response:
   async function agentCommand(action, button) {
     const descriptions = {
       load_model: ['加载推理模型', '按照已保存的配置，在当前 Kaggle 会话中加载模型。加载过程会使用内存、显存和 GPU 配额。', '加载模型'],
+      switch_model: ['切换推理模型', '当前请求完成后，Worker 会先停止已加载模型，再加载管理面板中已保存的目标模型。切换期间不能发送新请求。', '切换模型'],
       stop_model: ['停止推理进程', '停止当前模型进程。已连接的代理会保留，之后可以重新加载模型。', '停止模型'],
       shutdown: ['结束代理会话', '结束 Kaggle 代理连接。再次使用时需要重新运行接入 Notebook。', '结束会话']
     };
@@ -960,7 +1066,7 @@ for chunk in response:
   }
   async function sendChat(event) {
     event.preventDefault();
-    if (state.chatBusy || !modelReady()) return;
+    if (state.chatBusy || !modelCallable()) return;
     const prompt = $('#chat-input').value.trim();
     const submittedImages = state.chatImages.slice();
     if (!prompt && !submittedImages.length) return;
@@ -1021,7 +1127,7 @@ for chunk in response:
       const payload = await api('/api/bootstrap');
       const cfg = payload.config || {};
       const safeCfg = {};
-      ['public_url', 'server_url', 'backend', 'auto_load', 'llama_model_path', 'llama_mmproj_path', 'llama_server_path', 'llama_alias', 'llama_context_length', 'llama_kv_type', 'llama_batch_size', 'llama_ubatch_size', 'llama_tensor_split', 'context_length', 'model_path', 'strata_path', 'kv_type', 'low_ram', 'experimental_projection'].forEach(function (name) { if (cfg[name] !== undefined) safeCfg[name] = cfg[name]; });
+      ['public_url', 'server_url', 'backend', 'auto_load', 'llama_preset', 'llama_model_path', 'llama_mmproj_path', 'llama_server_path', 'llama_alias', 'llama_context_length', 'llama_kv_type', 'llama_batch_size', 'llama_ubatch_size', 'llama_tensor_split', 'context_length', 'model_path', 'strata_path', 'kv_type', 'low_ram', 'experimental_projection'].forEach(function (name) { if (cfg[name] !== undefined) safeCfg[name] = cfg[name]; });
       const lines = [
         '接入 Notebook：' + (payload.notebook_url || '/api/notebook'),
         '代理脚本：' + (payload.agent_download_url || '/api/agent-download'),
@@ -1064,10 +1170,11 @@ for chunk in response:
   });
   $('#model-form').addEventListener('submit', function (event) { event.preventDefault(); saveSettings(event.currentTarget, '#model-save-status'); });
   $('#model-backend').addEventListener('change', syncBackendForm);
+  $('#model-preset').addEventListener('change', function () { renderModelTarget(); updateActionAvailability(); });
   $('#settings-form').addEventListener('submit', function (event) { event.preventDefault(); saveSettings(event.currentTarget, '#settings-save-status'); });
   ['#model-form', '#settings-form'].forEach(function (selector) {
-    $(selector).addEventListener('input', function () { dirtyForms.add(this.id); });
-    $(selector).addEventListener('change', function () { dirtyForms.add(this.id); });
+    $(selector).addEventListener('input', function () { dirtyForms.add(this.id); updateActionAvailability(); });
+    $(selector).addEventListener('change', function () { dirtyForms.add(this.id); updateActionAvailability(); });
   });
   $('#key-form').addEventListener('submit', createKey);
   $('#dismiss-key-button').addEventListener('click', hideNewKey);

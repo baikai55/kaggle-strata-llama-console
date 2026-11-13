@@ -23,7 +23,7 @@ Kaggle 只建立出站 HTTPS 连接，不要求开放 Notebook 入站端口或�
 
 ## 任务
 
-任务只有 `chat` 和允许列表中的 `command`（load_model / stop_model / shutdown）。Worker 不执行任意远程命令。模型离线时 API 返回明确的不可用错误，不虚构结果。
+任务只有 `chat` 和允许列表中的 `command`（load_model / switch_model / stop_model / shutdown）。Worker 不执行任意远程命令。模型离线或当前模型与保存预设不一致时，API 返回明确的不可用错误，不虚构结果。
 
 普通 `/v1/chat/completions`、`/v1/models` 不触发 Runtime 启动，也不保存离线请求等待重放。只有管理站启动按钮或独立 Wake API 能进入启动状态机。
 
@@ -35,20 +35,22 @@ Kaggle 只建立出站 HTTPS 连接，不要求开放 Notebook 入站端口或�
 
 客户端断开 SSE 后，服务器在任务上记录取消请求；Worker 心跳或批次上传收到取消后只终止本次桥接子进程并关闭上游模型连接，不停止 `llama-server`。因此本次生成会尽快结束，已加载模型仍可继续接受下一次请求。桥接配置和请求正文经 stdin 传递，模型 API Key 不进入 argv 或子进程环境。
 
-每次推理在 SQLite 中写入独立请求记录，包含来源、Key 名称/前缀、模型、状态、耗时和模型实际返回的 token 用量。消息正文和完整 Key 不进入请求监控表。
+每次推理在 SQLite 中写入独立请求记录，包含来源、Key 名称/前缀、模型、状态、创建/领取/首 token/完成时间和模型实际返回的 token 用量。最终 SSE 的 llama.cpp `timings` 只提取 decode token 数与毫秒数；页面分别展示模型 decode TPS 与流式交付 TPS，消息正文和完整 Key 不进入请求监控表。
+
+`llama_preset` 只接受固定白名单 `qwen38_27b`、`ornith_35b_a3b` 与 `ornith_35b_a3b_vision`。Worker 心跳上报当前 `model.preset`，服务端将它与已保存目标预设比较；不一致时 `/v1/models` 返回空列表，聊天返回 503。切换命令排队后立即阻止新聊天，待既有任务结束再严格执行“停止旧进程 → 校验目标 Dataset → 启动新进程”。切换失败保持未就绪，不回退为旧模型 ready。Strata 不参与这条隐式切换路径，跨 backend 必须先显式停止。
 
 ## Kaggle 生命周期
 
-当前主线模型、`mmproj-F16.gguf`、`llama-server` 和运行信息存于私有 Dataset `job579/qwen3-8-27b-unsloth-q4-runtime`；Worker 只从这个已验证 Dataset 自动发现并复制运行时。固定 manifest 同时校验主模型与投影的名称、大小、SHA-256 和来源提交，启动 llama.cpp 时仅在投影验证通过后加入 `--mmproj` 并报告 `vision=true`。Strata 的 pack、tokenizer 和配置仍可作为兼容后端挂载。运行配置和临时缓存使用可写工作目录，每次会话仍须加载权重。Worker 默认空闲 5 分钟停止，最长 3 小时，不发送伪造使用活动规避配额。
+Qwen 模型、`mmproj-F16.gguf`、`llama-server` 和运行信息存于私有 Dataset `job579/qwen3-8-27b-unsloth-q4-runtime`；Ornith 模型、配套 mmproj 和固定来源清单存于 `job579/ornith-1-5-35b-a3b-q4-runtime`。专用 Runtime 按固定顺序同时挂载两套 Dataset，HTTP 调用方不能增删或替换；未加载的 Dataset 只作为只读 Input，不占模型 RAM/显存。Worker 始终从 Qwen Runtime Dataset 取得已验证 `llama-server`，再按 preset 从对应 Dataset 发现模型资产。固定 manifest 校验文件名、大小、来源提交和 SHA-256 声明；Qwen 和 Ornith 视觉预设加载各自配套投影，Ornith 高速文本预设只加载主模型。手动 Worker 默认空闲 8 分钟，托管 Runtime 可保持到 3 小时总时长上限；不发送伪造活动规避配额。
 
 配额页只调用 Kaggle v2.2.5 官方公开命令：`kaggle quota --format json` 查询 GPU/TPU，`kaggle benchmarks quota --format json` 查询 Daily/Monthly AI Models。查询有 15 秒超时和 60 秒进程内缓存，可部分成功。Private Datasets / Private Models 存储配额没有官方公开接口，因此不抓登录页私有 XHR，也不生成估算值。
 
-网站部署可先完成；用户配置 CF 域名后，在设置页保存公开 URL。首次启用一键启动时，服务器以 `--no-run` 创建固定私有 Notebook并核对 Private、T4 ×2、Internet 与唯一 Dataset。之后管理站或 Wake API 可提交这个专用 Commit Run；启动操作自动打开 `auto_load`，Worker 首次心跳后排队加载模型。原手动交互式 Notebook 仍可用 Kaggle Secret `STRATA_WORKER_KEY` 调试，但不属于一键启动控制链。
+网站部署可先完成；用户配置 CF 域名后，在设置页保存公开 URL。首次启用一键启动时，服务器以 `--no-run` 创建固定私有 Notebook并核对 Private、T4 ×2、Internet 与两套固定 Dataset。之后管理站或 Wake API 可提交这个专用 Commit Run；启动操作自动打开 `auto_load`，Worker 首次心跳后按保存的 preset 加载或切换模型。原手动交互式 Notebook 仍可用 Kaggle Secret `STRATA_WORKER_KEY` 调试，但不属于一键启动控制链。
 
 专用 Notebook、slug、T4 加速器、Internet 和 Dataset 均由服务器固定，HTTP 请求不能覆盖。`KAGGLE_API_TOKEN` 只进入白名单化的官方 CLI 子进程环境，不进入命令参数、Notebook、SQLite、响应或日志。Kaggle 官方 CLI Push 不能表达或继承网页 Secret 授权，因此 Runtime Notebook 不再读取长期 `STRATA_WORKER_KEY`；它只携带 operation 绑定、约 20 分钟有效的一次性 bootstrap，并通过 HTTPS 换取约 3 小时加 10 分钟停止宽限的临时 Worker session。
 
 bootstrap 首次成功兑换后只保留约 60 秒幂等重试窗。SQLite 仅保存 bootstrap/session 的 SHA-256 和期限；新 operation、确定提交失败、官方终止、Worker stopped 及停止收敛都会清理临时认证。长期 Worker Key 只保留在服务器环境和用户明确授权的手动 Notebook Secret 中。
 
-Runtime 状态以 SQLite 单例 `runtime_state` 保存，主要流转为 `stopped → queued_local → submitting → waiting_worker → loading_model → ready`，并包含 `unknown`、`failed`、`stop_requested`、`stopping`。事务、操作 ID 和 60 秒冷却防止重复 push；提交超时进入 `unknown`，服务重启后只查询官方状态，不重复提交。
+Runtime 状态以 SQLite 单例 `runtime_state` 保存，主要流转为 `stopped → queued_local → submitting → waiting_worker → loading_model → ready`，并包含 `model_switch_required`、`unknown`、`failed`、`stop_requested`、`stopping`。事务、操作 ID 和 60 秒冷却防止重复 push；提交超时进入 `unknown`，服务重启后只查询官方状态，不重复提交。
 
 尚未提交的本地启动可取消；一旦 Kaggle 已接收运行，当前官方接口没有硬取消能力。此时停止只记录 `stop_requested`，Worker 上线后优先领取 `shutdown`，不再自动加载，Commit Run 在 Worker 退出后自然完成。最终仍应通过 Kaggle 页面和官方配额确认 GPU 已释放。

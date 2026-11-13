@@ -26,10 +26,14 @@ import uuid
 
 import requests
 
-ALLOWED_ACTIONS = {"load_model", "stop_model", "shutdown"}
+ALLOWED_ACTIONS = {"load_model", "switch_model", "stop_model", "shutdown"}
 BACKENDS = ("llama_cpp", "strata")
 KV_TYPES = {"int8", "q4_0", "k8v4", "fp16"}
 LLAMA_KV_TYPES = {"q8_0", "f16"}
+DEFAULT_LLAMA_PRESET = "qwen38_27b"
+ORNITH_TEXT_PRESET = "ornith_35b_a3b"
+ORNITH_VISION_PRESET = "ornith_35b_a3b_vision"
+LLAMA_PRESETS = frozenset({DEFAULT_LLAMA_PRESET, ORNITH_TEXT_PRESET, ORNITH_VISION_PRESET})
 LLAMA_DATASET_ROOTS = (
     Path("/kaggle/input/datasets/job579/qwen3-8-27b-unsloth-q4-runtime"),
     Path("/kaggle/input/qwen3-8-27b-unsloth-q4-runtime"),
@@ -40,8 +44,20 @@ LLAMA_MMPROJ_NAME = "mmproj-F16.gguf"
 LLAMA_MMPROJ_BYTES = 927_607_488
 LLAMA_MMPROJ_SHA256 = "cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e"
 LLAMA_MMPROJ_SOURCE_COMMIT = "1cff334a4a228324d4ee1f76d55d372588f0d556"
+ORNITH_DATASET_ROOTS = (
+    Path("/kaggle/input/datasets/job579/ornith-1-5-35b-a3b-q4-runtime"),
+    Path("/kaggle/input/ornith-1-5-35b-a3b-q4-runtime"),
+)
+ORNITH_MODEL_REPO = "ornith-ai/Ornith-1.5-35B-A3B-GGUF"
+ORNITH_SOURCE_COMMIT = "12393612fd4f730ff5aadc23e9b8f9648aa49ceb"
+ORNITH_MODEL_NAME = "Ornith-1.5-35B-Q4_K_M.gguf"
+ORNITH_MODEL_BYTES = 21_713_463_040
+ORNITH_MODEL_SHA256 = "42739874cc2ccfdb8523b23fbe52e29b2a7555c8176737ca9ca0b5d59859d41f"
+ORNITH_MMPROJ_NAME = "mmproj-Ornith-1.5-35B-BF16.gguf"
+ORNITH_MMPROJ_BYTES = 902_822_240
+ORNITH_MMPROJ_SHA256 = "1921a36a85aee56cd2abd27f46701802c9d85a33474792e600df6c3b282a135d"
 MAX_RUNTIME = 3 * 60 * 60
-IDLE_TIMEOUT = 5 * 60
+IDLE_TIMEOUT = 8 * 60
 MODEL_PORT = 18080
 MODEL_LOG_BYTES = 256 * 1024
 MODEL_LOG_LINE_BYTES = 16 * 1024
@@ -69,6 +85,9 @@ import threading
 import time
 
 import requests
+
+
+MAX_SSE_LINE_BYTES = 2 * 1024 * 1024
 
 
 def write_all(stream, data):
@@ -102,6 +121,48 @@ def watch_parent(parent_pid):
         time.sleep(0.5)
 
 
+def iter_sse_events(response):
+    """Parse SSE from wire bytes without Unicode splitlines semantics."""
+    buffer = b""
+    data_lines = []
+
+    def consume(raw):
+        nonlocal data_lines
+        if len(raw) > MAX_SSE_LINE_BYTES:
+            raise ValueError("SSE line too large")
+        if raw.endswith(b"\r"):
+            raw = raw[:-1]
+        line = raw.decode("utf-8", errors="strict")
+        if line == "":
+            if data_lines:
+                event_data = "\n".join(data_lines)
+                data_lines = []
+                return event_data
+            return None
+        if line.startswith("data:"):
+            value = line[5:]
+            data_lines.append(value[1:] if value.startswith(" ") else value)
+        return None
+
+    for chunk in response.iter_content(chunk_size=4096):
+        if not chunk:
+            continue
+        buffer += chunk
+        if len(buffer) > MAX_SSE_LINE_BYTES and b"\n" not in buffer:
+            raise ValueError("SSE line too large")
+        while b"\n" in buffer:
+            raw, buffer = buffer.split(b"\n", 1)
+            event_data = consume(raw)
+            if event_data is not None:
+                yield event_data
+    if buffer:
+        event_data = consume(buffer)
+        if event_data is not None:
+            yield event_data
+    if data_lines:
+        yield "\n".join(data_lines)
+
+
 def main():
     config = json.loads(sys.stdin.buffer.read().decode("utf-8"))
     parent_pid = int(config.get("parent_pid") or 0)
@@ -119,23 +180,7 @@ def main():
         if not response.ok:
             emit({"type": "http_error", "status": response.status_code, "detail": error_detail(response)})
             return
-        response.encoding = "utf-8"
-        data_lines = []
-        for raw_line in response.iter_lines(chunk_size=1, decode_unicode=True):
-            line = raw_line.decode("utf-8", errors="strict") if isinstance(raw_line, bytes) else (raw_line or "")
-            if line == "":
-                if data_lines:
-                    event_data = "\n".join(data_lines)
-                    emit({"type": "event", "data": event_data})
-                    data_lines = []
-                    if event_data.strip() == "[DONE]":
-                        return
-                continue
-            if line.startswith("data:"):
-                value = line[5:]
-                data_lines.append(value[1:] if value.startswith(" ") else value)
-        if data_lines:
-            event_data = "\n".join(data_lines)
+        for event_data in iter_sse_events(response):
             emit({"type": "event", "data": event_data})
             if event_data.strip() == "[DONE]":
                 return
@@ -163,6 +208,52 @@ class JobCancelled(WorkerError):
     pass
 
 
+def llama_preset_spec(settings: dict) -> tuple[str, dict]:
+    """Resolve one fixed model preset; requests cannot add Dataset roots."""
+    preset = settings.get("llama_preset") or DEFAULT_LLAMA_PRESET
+    if preset not in LLAMA_PRESETS:
+        raise WorkerError("不支持的 llama.cpp 模型预设")
+    if preset == DEFAULT_LLAMA_PRESET:
+        return preset, {
+            "dataset_roots": LLAMA_DATASET_ROOTS,
+            "dataset_slug": "job579/qwen3-8-27b-unsloth-q4-runtime",
+            "manifest_name": "qwen38-cache-manifest.json",
+            "model_name": LLAMA_MODEL_NAME,
+            "model_bytes": LLAMA_MODEL_BYTES,
+            "model_sha256": None,
+            "model_repo": None,
+            "source_commit": None,
+            "mmproj_name": LLAMA_MMPROJ_NAME,
+            "mmproj_bytes": LLAMA_MMPROJ_BYTES,
+            "mmproj_sha256": LLAMA_MMPROJ_SHA256,
+            "mmproj_source_commit": LLAMA_MMPROJ_SOURCE_COMMIT,
+            "default_vision": True,
+            "alias": "qwen3.8-27b",
+            "context": 131072,
+        }
+    return preset, {
+        "dataset_roots": ORNITH_DATASET_ROOTS,
+        "dataset_slug": "job579/ornith-1-5-35b-a3b-q4-runtime",
+        "manifest_name": "ornith-cache-manifest.json",
+        "model_name": ORNITH_MODEL_NAME,
+        "model_bytes": ORNITH_MODEL_BYTES,
+        "model_sha256": ORNITH_MODEL_SHA256,
+        "model_repo": ORNITH_MODEL_REPO,
+        "source_commit": ORNITH_SOURCE_COMMIT,
+        "mmproj_name": ORNITH_MMPROJ_NAME,
+        "mmproj_bytes": ORNITH_MMPROJ_BYTES,
+        "mmproj_sha256": ORNITH_MMPROJ_SHA256,
+        "mmproj_source_commit": ORNITH_SOURCE_COMMIT,
+        # Keep text-only and vision presets separate so the user can choose
+        # whether to reserve memory for the projector without entering a raw
+        # Dataset path. Earlier 4.x measurements were control-plane delivery
+        # throughput, not llama.cpp decode throughput.
+        "default_vision": preset == ORNITH_VISION_PRESET,
+        "alias": "ornith-1.5-35b-a3b",
+        "context": 131072,
+    }
+
+
 class ChatCompletionAccumulator:
     """Rebuild one ordinary ChatCompletion from OpenAI-compatible SSE chunks."""
 
@@ -170,6 +261,7 @@ class ChatCompletionAccumulator:
         self.metadata = {}
         self.choices = {}
         self.usage = None
+        self.timings = None
 
     @staticmethod
     def _append(container, key, value):
@@ -186,6 +278,8 @@ class ChatCompletionAccumulator:
                 self.metadata[key] = chunk[key]
         if isinstance(chunk.get("usage"), dict):
             self.usage = chunk["usage"]
+        if isinstance(chunk.get("timings"), dict):
+            self.timings = chunk["timings"]
         raw_choices = chunk.get("choices", [])
         if not isinstance(raw_choices, list):
             raise WorkerError("模型流式响应 choices 无效")
@@ -245,6 +339,8 @@ class ChatCompletionAccumulator:
         result = {**self.metadata, "object": "chat.completion", "choices": choices}
         if self.usage is not None:
             result["usage"] = self.usage
+        if self.timings is not None:
+            result["timings"] = self.timings
         return result
 
 
@@ -459,20 +555,25 @@ def prepare_llama(settings: dict, work_dir: Path, model_key: str,
     is copied into the work directory.
     """
     production = allowed_roots is None
+    preset, spec = llama_preset_spec(settings)
     # The worker only executes the binary from the private, already verified
-    # runtime Dataset. Mounting another Dataset must not silently expand the
-    # executable search path.
+    # Qwen runtime Dataset. Mounting another model Dataset must not silently
+    # expand the executable search path.
     if production:
-        mounted = [path for path in LLAMA_DATASET_ROOTS if path.is_dir()]
-        if len(mounted) != 1:
-            raise WorkerError("请挂载私有 Dataset job579/qwen3-8-27b-unsloth-q4-runtime；必须且只能识别一个挂载根目录")
-        roots = mounted
+        model_mounts = [path for path in spec["dataset_roots"] if path.is_dir()]
+        if len(model_mounts) != 1:
+            raise WorkerError(f"请挂载私有 Dataset {spec['dataset_slug']}；必须且只能识别一个模型挂载根目录")
+        runtime_mounts = [path for path in LLAMA_DATASET_ROOTS if path.is_dir()]
+        if len(runtime_mounts) != 1:
+            raise WorkerError("请挂载私有 Dataset job579/qwen3-8-27b-unsloth-q4-runtime；必须且只能识别一个运行时挂载根目录")
+        model_roots = model_mounts
+        runtime_roots = runtime_mounts
     else:
-        roots = allowed_roots
-    search = roots
+        model_roots = allowed_roots
+        runtime_roots = allowed_roots
 
-    def locate(value, kind, label, *, required=True):
-        scope = search
+    def locate(value, kind, label, roots, *, required=True):
+        scope = roots
         must_find = required or bool(value)
         if value:
             path = resolve_file(value, Path.cwd(), roots)
@@ -501,55 +602,78 @@ def prepare_llama(settings: dict, work_dir: Path, model_key: str,
         with path.open("rb") as stream:
             return stream.read(len(expected)) == expected
 
-    model = locate(settings.get("llama_model_path"), "model", " GGUF 模型")
+    model = locate(settings.get("llama_model_path"), "model", " GGUF 模型", model_roots)
     if not model.is_file() or model.suffix.lower() != ".gguf":
         raise WorkerError("模型路径应指向 .gguf 文件，或只含一个 GGUF 的目录")
     if not magic(model, b"GGUF"):
         raise WorkerError("模型文件头不是 GGUF；请检查 Dataset 是否完整")
-    mmproj = locate(settings.get("llama_mmproj_path"), "mmproj", "视觉投影 GGUF", required=False)
+    mmproj_value = settings.get("llama_mmproj_path")
+    mmproj = (locate(mmproj_value, "mmproj", "视觉投影 GGUF", model_roots, required=False)
+              if mmproj_value or spec["default_vision"] else None)
     if mmproj is not None:
         if not mmproj.is_file() or mmproj.suffix.lower() != ".gguf":
             raise WorkerError("视觉投影路径应指向 mmproj-*.gguf 文件，或只含一个投影的目录")
         if not magic(mmproj, b"GGUF"):
             raise WorkerError("视觉投影文件头不是 GGUF；请检查 Dataset 是否完整")
-    source = locate(settings.get("llama_server_path"), "server", " llama-server")
+    source = locate(settings.get("llama_server_path"), "server", " llama-server", runtime_roots)
     if source.name != "llama-server" or not source.is_file():
         raise WorkerError("运行时必须是名为 llama-server 的文件，或只含一个 llama-server 的目录")
     if not magic(source, b"\x7fELF"):
         raise WorkerError("llama-server 不是 Linux 可执行文件；Worker 不运行脚本")
     if production:
-        dataset = roots[0].resolve()
-        if model.name != LLAMA_MODEL_NAME or model.stat().st_size != LLAMA_MODEL_BYTES:
-            raise WorkerError("挂载的 GGUF 与已验证的 Qwen3.8-27B 模型不匹配")
-        if dataset not in model.parents or dataset not in source.parents or (mmproj is not None and dataset not in mmproj.parents):
-            raise WorkerError("llama.cpp 输入必须来自已验证的私有 Dataset")
-        manifest_path = dataset / "qwen38-cache-manifest.json"
+        model_dataset = model_roots[0].resolve()
+        runtime_dataset = runtime_roots[0].resolve()
+        if model.name != spec["model_name"] or model.stat().st_size != spec["model_bytes"]:
+            raise WorkerError("挂载的 GGUF 与所选 llama.cpp 模型预设不匹配")
+        if (model_dataset not in model.parents or runtime_dataset not in source.parents
+                or (mmproj is not None and model_dataset not in mmproj.parents)):
+            raise WorkerError("llama.cpp 模型与运行时必须来自各自已验证的私有 Dataset")
+        manifest_path = model_dataset / spec["manifest_name"]
+        runtime_manifest_path = runtime_dataset / "qwen38-cache-manifest.json"
         commit_path = source.parent / "LLAMA_CPP_COMMIT.txt"
         try:
-            if manifest_path.is_symlink() or commit_path.is_symlink() or manifest_path.stat().st_size > 65536:
+            if (manifest_path.is_symlink() or runtime_manifest_path.is_symlink() or commit_path.is_symlink()
+                    or manifest_path.stat().st_size > 65536 or runtime_manifest_path.stat().st_size > 65536):
                 raise OSError
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            runtime_manifest = (manifest if runtime_manifest_path == manifest_path else
+                                json.loads(runtime_manifest_path.read_text(encoding="utf-8")))
             commit = commit_path.read_text(encoding="ascii").strip().lower()
         except (OSError, UnicodeError, json.JSONDecodeError):
             raise WorkerError("llama.cpp Dataset 缺少可验证的运行时清单") from None
         if (manifest.get("model_file") != model.name or manifest.get("model_bytes") != model.stat().st_size
                 or not re.fullmatch(r"[0-9a-f]{40}", commit)
-                or str(manifest.get("llama_cpp_commit", "")).lower() != commit):
+                or str(runtime_manifest.get("llama_cpp_commit", "")).lower() != commit):
             raise WorkerError("llama.cpp Dataset 清单与模型或运行时不匹配")
+        if spec["model_sha256"]:
+            # Fast production trust boundary: Kaggle Dataset versions are
+            # immutable and the private version is fully hashed when it is
+            # published/accepted. Re-reading 21.7 GB on every cold load would
+            # add minutes of Input I/O before llama.cpp can start. At runtime
+            # bind the asset to the fixed mount, exact filename/byte count,
+            # GGUF magic and a manifest pinned to repo + commit + full SHA256.
+            # This validates the mounted Dataset identity; it intentionally
+            # does not claim to recompute the large model digest in-session.
+            declared_model_sha256 = str(manifest.get("model_sha256", "")).lower()
+            if (declared_model_sha256 != spec["model_sha256"]
+                    or not re.fullmatch(r"[0-9a-f]{64}", declared_model_sha256)
+                    or manifest.get("model_repo") != spec["model_repo"]
+                    or str(manifest.get("model_source_commit", "")).lower() != spec["source_commit"]):
+                raise WorkerError("llama.cpp Dataset 清单与固定模型来源不匹配")
         manifest_mmproj = manifest.get("mmproj_file")
         if mmproj is None:
-            if manifest_mmproj:
+            if spec["default_vision"] and manifest_mmproj:
                 raise WorkerError("llama.cpp Dataset 清单声明了视觉投影，但文件不存在")
         else:
-            if (mmproj.name != LLAMA_MMPROJ_NAME or mmproj.stat().st_size != LLAMA_MMPROJ_BYTES
-                    or file_sha256(mmproj) != LLAMA_MMPROJ_SHA256):
-                raise WorkerError("挂载的视觉投影与已验证的 Qwen3.8 F16 mmproj 不匹配")
+            if (mmproj.name != spec["mmproj_name"] or mmproj.stat().st_size != spec["mmproj_bytes"]
+                    or file_sha256(mmproj) != spec["mmproj_sha256"]):
+                raise WorkerError("挂载的视觉投影与所选 llama.cpp 模型预设不匹配")
             if (manifest_mmproj != mmproj.name
                     or manifest.get("mmproj_bytes") != mmproj.stat().st_size
-                    or str(manifest.get("mmproj_sha256", "")).lower() != LLAMA_MMPROJ_SHA256
-                    or str(manifest.get("mmproj_source_commit", "")).lower() != LLAMA_MMPROJ_SOURCE_COMMIT):
+                    or str(manifest.get("mmproj_sha256", "")).lower() != spec["mmproj_sha256"]
+                    or str(manifest.get("mmproj_source_commit", "")).lower() != spec["mmproj_source_commit"]):
                 raise WorkerError("llama.cpp Dataset 清单与视觉投影不匹配")
-    context = number(settings.get("llama_context_length", 131072), "上下文长度", 1024, 1048576)
+    context = number(settings.get("llama_context_length", spec["context"]), "上下文长度", 1024, 1048576)
     kv = settings.get("llama_kv_type", "q8_0")
     if kv not in LLAMA_KV_TYPES:
         raise WorkerError("不支持的 KV 缓存精度")
@@ -561,7 +685,10 @@ def prepare_llama(settings: dict, work_dir: Path, model_key: str,
     split = str(settings.get("llama_tensor_split") or "1,1")
     if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3})?,\d{1,3}(?:\.\d{1,3})?", split):
         raise WorkerError("双卡切分比例应为两个数字，例如 1,1")
-    alias = str(settings.get("llama_alias") or "qwen3.8-27b")
+    # Production aliases are part of the fixed preset. This also prevents an
+    # older database's Qwen default alias from leaking into Ornith after the
+    # user selects the new preset.
+    alias = spec["alias"] if production else str(settings.get("llama_alias") or spec["alias"])
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", alias):
         raise WorkerError("模型别名只能包含字母、数字和 . _ : -")
     runtime = work_dir / "llama-runtime"
@@ -597,7 +724,8 @@ def prepare_llama(settings: dict, work_dir: Path, model_key: str,
            "--host", "127.0.0.1", "--port", str(port), "--metrics"]
     if mmproj is not None:
         cmd.extend(["--mmproj", str(mmproj)])
-    return cmd, work_dir, env, {"alias": alias, "context": context, "vision": mmproj is not None}
+    return cmd, work_dir, env, {"alias": alias, "context": context, "vision": mmproj is not None,
+                                "preset": preset}
 
 
 def prepare_config(settings: dict, work_dir: Path, model_key: str,
@@ -764,7 +892,10 @@ class Worker:
         self.worker_id = "kaggle-" + uuid.uuid4().hex
         self.work_dir = Path(work_dir)
         self.max_runtime = min(float(max_runtime), MAX_RUNTIME)
-        self.idle_timeout = min(float(idle_timeout), IDLE_TIMEOUT)
+        # Manual notebooks keep the conservative eight-minute default, while
+        # the one-click managed Runtime may explicitly stay up to MAX_RUNTIME
+        # when the user asks to keep the model online for follow-up testing.
+        self.idle_timeout = min(float(idle_timeout), MAX_RUNTIME)
         if min(self.max_runtime, self.idle_timeout) <= 0:
             raise WorkerError("会话时限必须为正数")
         self.started = time.monotonic()
@@ -1044,11 +1175,14 @@ class Worker:
             raise WorkerError("需要启用 Kaggle T4 ×2；当前未检测到两张 GPU")
         label = "llama.cpp" if backend == "llama_cpp" else "Strata"
         info = {"backend": backend}
+        if backend == "llama_cpp":
+            info["preset"] = llama_preset_spec(settings)[0]
         self.model = {"name": "", "status": "loading", **info}; self.status = "loading"
         alias = None
         if backend == "llama_cpp":
             cmd, cwd, env, launch = prepare_llama(settings, self.work_dir, self.model_key, port=self.model_port)
-            alias, info["context"], info["vision"] = launch["alias"], launch["context"], launch["vision"]
+            alias, info["context"], info["vision"], info["preset"] = (
+                launch["alias"], launch["context"], launch["vision"], launch["preset"])
         else:
             cmd, cwd, env = prepare_config(settings, self.work_dir, self.model_key, port=self.model_port)
         self.backend = backend
@@ -1210,7 +1344,12 @@ class Worker:
                             or now - batch_started >= STREAM_BATCH_SECONDS):
                         self.upload_stream_batch(control_session, job, sequence, batch, cancel_event)
                         sequence += 1
-                        batch, batch_bytes, batch_started = [], 0, now
+                        batch, batch_bytes = [], 0
+                        # Network upload time is not part of the next batching
+                        # window. Reusing the pre-upload timestamp causes a
+                        # slow control-plane round trip to flush every token in
+                        # a separate POST and throttles delivery to about 4 t/s.
+                        batch_started = time.monotonic()
                 if batch:
                     self.upload_stream_batch(control_session, job, sequence, batch, cancel_event)
                 if cancel_event.is_set():
@@ -1230,6 +1369,15 @@ class Worker:
                 raise WorkerError("不允许的 Worker 命令")
             if action == "load_model":
                 return self.load_model(payload.get("settings") or self.settings, deadline)
+            if action == "switch_model":
+                settings = payload.get("settings") or self.settings
+                if settings.get("backend", "strata") != "llama_cpp":
+                    raise WorkerError("固定模型预设切换仅支持 llama.cpp")
+                # Validate the target before taking a healthy model offline.
+                llama_preset_spec(settings)
+                self.stop_model()
+                result = self.load_model(settings, deadline)
+                return {**result, "message": "模型切换完成"}
             self.stop_model()
             if action == "shutdown":
                 self.stop_event.set()
@@ -1292,7 +1440,8 @@ class Worker:
                 break
         if cancel_event.is_set() and not box.get("error"):
             box = {"cancelled": box.get("cancelled") or "调用方已断开连接，推理已取消"}
-        if box.get("error") and job.get("type") == "command" and job.get("payload", {}).get("action") == "load_model":
+        if (box.get("error") and job.get("type") == "command"
+                and job.get("payload", {}).get("action") in ("load_model", "switch_model")):
             self.stop_model()
         if box.get("cancelled"):
             reply = {"worker_id": self.worker_id, "lease_token": job["lease_token"],
@@ -1328,7 +1477,7 @@ class Worker:
         self.last_activity = time.monotonic()
 
     def run(self):
-        self.log("Kaggle Worker 启动；默认空闲 5 分钟或最多 3 小时退出")
+        self.log("Kaggle Worker 启动；默认空闲 8 分钟或最多 3 小时退出")
         heartbeat = threading.Thread(target=self.heartbeat_loop, daemon=True)
         heartbeat.start()
         try:

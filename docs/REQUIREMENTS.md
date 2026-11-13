@@ -1,6 +1,6 @@
 # Kaggle Strata Console 需求
 
-最后更新：2026-11-13，Asia/Hong_Kong。
+最后更新：2026-11-14，Asia/Hong_Kong。
 
 ## 用户已确认
 
@@ -13,7 +13,7 @@
 - 2026-11-12 用户明确优先“5分钟以内，随开随用”。已验证的 16.6GB llama.cpp 方案一次端到端冷启动约 4 分 22 秒，达到当次目标；GPU 排队和 Input 挂载无保证，仍须分别记录，不能承诺每次都在 5 分钟内。
 - 希望减少拒答，当前主线使用社区 Unsloth Qwen3.8-27B UD-Q4_K_M；不自动开启 Strata 运行时投影。
 - 需要网站监控会话、GPU/RAM、模型状态、日志和请求调用元数据；管理模型配置和 API Key；支持聊天测试。请求监控不得保存消息正文或完整 Key。
-- 聊天与 OpenAI 兼容接口的默认最大输出改为 32,768 tokens；Worker 默认空闲退出改为 5 分钟。
+- 聊天与 OpenAI 兼容接口的默认最大输出改为 32,768 tokens；手动 Worker 默认空闲退出改为 8 分钟，托管 Runtime 仍可保持到 3 小时。
 - 增加 Kaggle 配额页：仅使用 Kaggle 官方接口查询 GPU、TPU、Daily AI Models 和 Monthly AI Models；Token 只配置在服务器环境。Private Datasets / Private Models 没有官方接口时明确标注不支持，不抓登录页面私有 XHR。
 - 日常启动简化为管理站“一键启动算力”：通过 Kaggle 官方接口提交固定私有 Commit Run，Worker 上线后自动加载模型；另提供独立 Wake API。普通聊天和模型列表请求不得默认唤醒 GPU。
 - API Key 增加独立 `can_wake` 权限，默认关闭；旧 Key 不因升级获得唤醒权限。任意有效 Key 可查询 Runtime 状态，只有明确授权的 Key 可触发 Wake。
@@ -23,13 +23,17 @@
 - `llama.cpp` 推理必须从模型到 Worker、管理站、Cloudflare 和 CPA 全链路实时转发 OpenAI SSE；文本、reasoning、工具调用、usage、结束原因和 `[DONE]` 不得在中间层丢失或整包缓冲。
 - 客户端中途断开流式响应时，只取消当前推理并关闭对应模型连接；不得杀死已加载的 `llama-server`，后续请求应能继续成功。
 - 当前 Qwen3.8 llama.cpp 主线需要识图：私有 Dataset 必须携带与模型匹配且可验证的 mmproj，Worker 心跳明确报告视觉能力；未加载投影时图片请求须返回清晰 409，而不是上游 HTTP 500。
+- 管理面板需支持固定 `qwen38_27b`、`ornith_35b_a3b`（高速文本）与 `ornith_35b_a3b_vision`（配套视觉投影）预设；页面必须区分“当前已加载模型”和“已保存目标预设”。表单未保存或模型不一致时不得继续聊天。
+- 同一 Kaggle Runtime 固定挂载两套 llama.cpp Dataset。切换必须等待已有任务结束、先停止旧模型、再加载新模型；一旦切换任务排队就拒绝新聊天，避免请求落到错误模型。llama.cpp 与 Strata 之间仍要求先显式停止，不允许自动跨后端切换。
 - 首版图片输入只接受 user 消息中的 JPEG/PNG Base64 Data URI，不直接抓取 HTTP、私网或本地文件 URL；限制图片数量、解码字节、边长和总像素，任务终态必须清空 SQLite 中的图片 payload。
 - 管理页需支持选图、压缩、预览、删除和失败后恢复待发内容；文本聊天在没有图片时保持原有兼容行为。
 - 项目文档保存决策、状态、访问方式及剩余事项，避免上下文压缩后遗漏。
 
 ## 当前模型主线
 
-当前默认是私有 Dataset `job579/qwen3-8-27b-unsloth-q4-runtime` 中的 Unsloth `Qwen3.8-27B-UD-Q4_K_M`，GGUF 16,564,259,744 bytes，并配套 `mmproj-F16.gguf` 927,607,488 bytes；使用 `llama.cpp`、双 T4、Q8 KV、显式双卡切分。128K 与 256K 均已在 Notebook 本机 API 实测，管理站默认 128K；0.6.0 已完成公开 API 真实图片识别。
+当前稳定默认是私有 Dataset `job579/qwen3-8-27b-unsloth-q4-runtime` 中的 Unsloth `Qwen3.8-27B-UD-Q4_K_M`，GGUF 16,564,259,744 bytes，并配套 `mmproj-F16.gguf` 927,607,488 bytes；使用 `llama.cpp`、双 T4、Q8 KV、显式双卡切分。128K 与 256K 均已在 Notebook 本机 API 实测，管理站默认 128K；0.6.0 已完成公开 API 真实图片识别。
+
+0.7.0 增加快速候选预设 `ornith_35b_a3b`，固定指向私有 Dataset `job579/ornith-1-5-35b-a3b-q4-runtime` 中的 `Ornith-1.5-35B-Q4_K_M.gguf`（21,713,463,040 bytes）及配套 mmproj（902,822,240 bytes）。0.7.1 将 Ornith 默认设为不加载 mmproj 的高速文本模式；0.7.2 增加显式视觉预设，仍只接受同仓库同 commit 的固定投影。Qwen 继续默认视觉。
 
 原 88.88GB RVN IQ3_S Strata-ready 包因随机 I/O 极慢、加载约 14 分钟仍未 ready，不满足 5 分钟目标，保留为历史与兼容方案，不再作为默认。不要使用已被作者撤下推荐的 OrcaRouter NVFP4 Agent 包。
 
@@ -48,3 +52,5 @@
 11. 一键启动经真实 Kaggle Commit Run 验证 bootstrap 兑换、临时 Worker 鉴权、自动加载和停止收敛；在完成该真机复测前，本地测试通过不得写成已上线成功。
 12. 真实 `llama.cpp` 请求经 Cloudflare 与 CPA 均能持续流式超过 125 秒；断连后任务进入取消、模型保持 ready，随后短请求继续成功。
 13. 视觉版 Dataset、`--mmproj` 启动、`vision=true` 心跳、无投影 409、安全图片校验、前端选图和真实图片回答均有当前证据；完成后图片 payload 不留在任务记录中。
+14. 管理面板能保存模型预设并在同一 Worker 会话内执行 Qwen ↔ Ornith 原子切换；切换期间模型列表为空、聊天明确 503，切换失败不得把旧模型继续标记为 ready，且能安全回切。
+15. 请求监控应区分排队、TTFT 与生成耗时，并以首 token 到完成的区间计算 decode tok/s；旧记录无分段时序时显示未知，不得用端到端总耗时冒充解码速度。

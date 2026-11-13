@@ -8,7 +8,7 @@
 - 如无法安全可靠自动开关Kaggle会话，提供清晰的手动操作入口和状态。
 - 继续保持Kaggle仅HTTPS出站、模型API只监听127.0.0.1，不引入Notebook公网隧道。
 
-现状：Worker固定默认5分钟空闲、3小时总时长、30分钟任务截止；这些停止自身/模型，不保证释放Kaggle Session。已在管理站提供停止模型与结束Worker命令。
+现状：手动 Worker 固定默认 8 分钟空闲、3 小时总时长、30 分钟任务截止；托管 Runtime 可保持到同一 3 小时硬上限。这些停止自身/模型，不保证释放 Kaggle Session。已在管理站提供停止模型与结束 Worker 命令。
 
 2026-11-12 线上 0.3.2 已加入请求监控和 Kaggle 官方配额页：配额只覆盖官方公开的 GPU、TPU、Daily AI Models、Monthly AI Models；认证只从服务端 `KAGGLE_API_TOKEN` 读取。Private Datasets / Private Models 存储配额没有官方公开接口，除非 Kaggle 后续正式提供，否则不抓登录页私有 XHR、不估算也不伪造。请求监控只保留运行元数据，不保存消息正文或完整 Key。
 

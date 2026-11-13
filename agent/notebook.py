@@ -42,7 +42,7 @@ def build_notebook(server_url: str, worker_key: str, worker_source: str) -> dict
             markdown("## 运行 Worker\n\n"
                      "此单元会持续运行。控制台显示在线后，选择运行后端并点击加载模型。\n\n"
                      "llama.cpp：挂载上述私有 Dataset 后，GGUF 与 llama-server 路径通常可留空，Worker 会自动查找唯一匹配。Strata：填写已准备好的 `strata-*.json` 与程序路径。\n\n"
-                     "默认空闲 5 分钟退出；最长 3 小时含加载与推理。网络失联会停止模型。结束后仍需在 Kaggle 页面停止 Session，确认释放 GPU 配额。\n\n"
+                     "默认空闲 8 分钟退出；最长 3 小时含加载与推理。网络失联会停止模型。结束后仍需在 Kaggle 页面停止 Session，确认释放 GPU 配额。\n\n"
                      "停止模型/结束会话命令按队列执行；若请求长时间卡住，可直接中断本单元。"),
             code("import runpy\nfrom kaggle_secrets import UserSecretsClient\n"
                  f"SERVER_URL = {server_url!r}\n"
@@ -83,7 +83,7 @@ def build_runtime_notebook(server_url: str, worker_source: str, operation_id: st
             markdown("# Kaggle Strata Console Runtime\n\n"
                      "此私有 Notebook 由管理站通过 Kaggle 官方 API 提交运行。它只携带一次性、"
                      "短期且绑定本次启动操作的凭据；长期 `STRATA_WORKER_KEY` 不进入 Notebook。\n\n"
-                     "Worker 空闲 5 分钟或总运行 3 小时后退出；最后一个单元结束后，本次 Commit Run 自然完成。"),
+                     "本次托管 Runtime 最长运行 3 小时；最后一个单元结束后，本次 Commit Run 自然完成。"),
             code("import base64, pathlib, platform, subprocess\n"
                  "if platform.system() != 'Linux':\n    raise RuntimeError('需要 Kaggle Linux Runtime')\n"
                  "subprocess.run(['nvidia-smi', '--query-gpu=index,name,memory.total', '--format=csv,noheader'], check=True)\n"
@@ -109,7 +109,8 @@ def build_runtime_notebook(server_url: str, worker_source: str, operation_id: st
                  "    raise RuntimeError('Runtime Worker 临时会话凭据无效')\n"
                  "RUNTIME_BOOTSTRAP_TOKEN = None\n"
                  "worker_namespace = runpy.run_path(str(WORKER_FILE), run_name='strata_console_runtime_worker')\n"
-                 "worker = worker_namespace['Worker'](SERVER_URL, worker_session_token)\n"
+                 "worker = worker_namespace['Worker'](SERVER_URL, worker_session_token, "
+                 "idle_timeout=worker_namespace['MAX_RUNTIME'])\n"
                  "worker_session_token = None\n"
                  "try:\n    worker.run()\nfinally:\n    worker.stop_event.set()\n    worker.stop_model()\n"),
         ],

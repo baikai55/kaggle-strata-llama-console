@@ -7,6 +7,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import math
 import os
 import platform
 import re
@@ -35,7 +36,7 @@ from app.kaggle_runtime import KaggleRuntimeClient, KaggleRuntimeError
 
 ROOT = Path(__file__).resolve().parent.parent
 SESSION_COOKIE = "strata_session"
-VERSION = "0.6.0"
+VERSION = "0.7.2"
 WORKER_TTL = 45
 JOB_TIMEOUT = 1800
 MAX_BODY = 4 * 1024 * 1024
@@ -56,13 +57,42 @@ TERMINAL = ("completed", "failed", "cancelled", "expired")
 LLAMA_DATASET_PREFIXES = (
     "/kaggle/input/datasets/job579/qwen3-8-27b-unsloth-q4-runtime",
     "/kaggle/input/qwen3-8-27b-unsloth-q4-runtime",
+    "/kaggle/input/datasets/job579/ornith-1-5-35b-a3b-q4-runtime",
+    "/kaggle/input/ornith-1-5-35b-a3b-q4-runtime",
 )
+LLAMA_PRESET_DEFAULTS = {
+    "qwen38_27b": {
+        "llama_alias": "qwen3.8-27b",
+        "llama_context_length": 131072,
+        "llama_kv_type": "q8_0",
+        "llama_batch_size": 1024,
+        "llama_ubatch_size": 256,
+        "llama_tensor_split": "1,1",
+    },
+    "ornith_35b_a3b": {
+        "llama_alias": "ornith-1.5-35b-a3b",
+        "llama_context_length": 131072,
+        "llama_kv_type": "q8_0",
+        "llama_batch_size": 256,
+        "llama_ubatch_size": 64,
+        "llama_tensor_split": "1,1",
+    },
+    "ornith_35b_a3b_vision": {
+        "llama_alias": "ornith-1.5-35b-a3b",
+        "llama_context_length": 131072,
+        "llama_kv_type": "q8_0",
+        "llama_batch_size": 256,
+        "llama_ubatch_size": 64,
+        "llama_tensor_split": "1,1",
+    },
+}
 # Stored settings are merged over these, so older databases gain new fields.
 DEFAULT_SETTINGS = {"public_url": "", "backend": "llama_cpp", "auto_load": False,
                     "model_path": "", "strata_path": "/kaggle/working/Strata",
                     "context_length": 131072, "kv_type": "int8", "low_ram": True,
                     "experimental_projection": False,
                     "llama_model_path": "", "llama_server_path": "", "llama_mmproj_path": "",
+                    "llama_preset": "qwen38_27b",
                     "llama_alias": "qwen3.8-27b",
                     "llama_context_length": 131072, "llama_kv_type": "q8_0", "llama_batch_size": 0,
                     "llama_ubatch_size": 0, "llama_tensor_split": "1,1"}
@@ -140,6 +170,7 @@ class Settings(StrictModel):
     llama_model_path: str | None = Field(default=None, max_length=2048)
     llama_server_path: str | None = Field(default=None, max_length=2048)
     llama_mmproj_path: str | None = Field(default=None, max_length=2048)
+    llama_preset: Literal["qwen38_27b", "ornith_35b_a3b", "ornith_35b_a3b_vision"] | None = None
     llama_alias: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
     llama_context_length: int | None = Field(default=None, ge=1024, le=1048576)
     llama_kv_type: Literal["q8_0", "f16"] | None = None
@@ -179,7 +210,7 @@ class KeyName(StrictModel):
 
 
 class Command(StrictModel):
-    action: Literal["load_model", "stop_model", "shutdown"]
+    action: Literal["load_model", "switch_model", "stop_model", "shutdown"]
 
 
 class RuntimeBootstrap(StrictModel):
@@ -400,12 +431,16 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                     model TEXT NOT NULL,
                     status TEXT NOT NULL,
                     created_at REAL NOT NULL,
+                    started_at REAL,
+                    first_token_at REAL,
                     completed_at REAL,
                     duration_ms INTEGER,
                     prompt_tokens INTEGER NOT NULL DEFAULT 0,
                     completion_tokens INTEGER NOT NULL DEFAULT 0,
                     total_tokens INTEGER NOT NULL DEFAULT 0,
                     cached_tokens INTEGER NOT NULL DEFAULT 0,
+                    model_decode_tokens INTEGER,
+                    model_decode_ms REAL,
                     error TEXT
                 );
                 CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, level TEXT, message TEXT);
@@ -442,6 +477,15 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             }.items():
                 if name not in job_columns:
                     c.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+            request_columns = {row[1] for row in c.execute("PRAGMA table_info(request_logs)")}
+            for name, definition in {
+                "started_at": "REAL",
+                "first_token_at": "REAL",
+                "model_decode_tokens": "INTEGER",
+                "model_decode_ms": "REAL",
+            }.items():
+                if name not in request_columns:
+                    c.execute(f"ALTER TABLE request_logs ADD COLUMN {name} {definition}")
             runtime_columns = {row[1] for row in c.execute("PRAGMA table_info(runtime_state)")}
             for name, definition in {
                 "bootstrap_hash": "TEXT",
@@ -493,12 +537,41 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
     def usage_value(value):
         return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
+    def model_decode_timing(c, job_id, result):
+        """Read llama.cpp compute timings without retaining prompt or answer text."""
+        candidates = []
+        if isinstance(result, dict) and isinstance(result.get("timings"), dict):
+            candidates.append(result["timings"])
+        # 0.7.1 workers forward the raw final SSE chunk but their accumulator
+        # drops `timings`. Read only a few tail batches for upgrade continuity.
+        for row in c.execute("SELECT payload FROM job_stream_batches WHERE job_id=? ORDER BY seq DESC LIMIT 4",
+                             (job_id,)):
+            try:
+                chunks = json.loads(row["payload"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(chunks, list):
+                continue
+            for chunk in reversed(chunks):
+                if isinstance(chunk, dict) and isinstance(chunk.get("timings"), dict):
+                    candidates.append(chunk["timings"])
+        for timings in candidates:
+            tokens = timings.get("predicted_n")
+            milliseconds = timings.get("predicted_ms")
+            if (isinstance(tokens, int) and not isinstance(tokens, bool) and tokens > 0
+                    and isinstance(milliseconds, (int, float)) and not isinstance(milliseconds, bool)
+                    and math.isfinite(float(milliseconds)) and milliseconds > 0):
+                return tokens, float(milliseconds)
+        return None, None
+
     def update_request_log(c, job_id, status, result=None, error=None, now=None):
         row = c.execute("SELECT created_at FROM request_logs WHERE job_id=?", (job_id,)).fetchone()
         if not row:
             return
         if status == "running":
-            c.execute("UPDATE request_logs SET status='running' WHERE job_id=? AND status='pending'", (job_id,))
+            started_at = now or time.time()
+            c.execute("UPDATE request_logs SET status='running',started_at=COALESCE(started_at,?) "
+                      "WHERE job_id=? AND status='pending'", (started_at, job_id))
             return
         if status not in TERMINAL:
             return
@@ -506,12 +579,14 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
         usage = result.get("usage") if isinstance(result, dict) and isinstance(result.get("usage"), dict) else {}
         details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
         cached = details.get("cached_tokens", usage.get("cached_tokens", 0))
+        decode_tokens, decode_ms = model_decode_timing(c, job_id, result)
         safe_error = redact(error)[:500] if error else None
         c.execute("UPDATE request_logs SET status=?,completed_at=?,duration_ms=?,prompt_tokens=?,completion_tokens=?,"
-                  "total_tokens=?,cached_tokens=?,error=? WHERE job_id=?",
+                  "total_tokens=?,cached_tokens=?,model_decode_tokens=?,model_decode_ms=?,error=? WHERE job_id=?",
                   (status, completed_at, max(0, round((completed_at - row["created_at"]) * 1000)),
                    usage_value(usage.get("prompt_tokens")), usage_value(usage.get("completion_tokens")),
-                   usage_value(usage.get("total_tokens")), usage_value(cached), safe_error, job_id))
+                   usage_value(usage.get("total_tokens")), usage_value(cached), decode_tokens, decode_ms,
+                   safe_error, job_id))
 
     def add_job(c, kind, payload, worker_id, request_meta=None):
         now = time.time()
@@ -596,8 +671,33 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
     def online(worker):
         return worker and worker.get("status") not in ("offline", "stopped")
 
-    def ready(worker):
-        return online(worker) and worker.get("status") in ("online", "idle", "ready") and isinstance(worker.get("model"), dict) and worker["model"].get("status") == "ready"
+    def worker_model_preset(worker):
+        model = worker.get("model") if isinstance(worker, dict) else None
+        if not isinstance(model, dict):
+            return None
+        preset = model.get("preset")
+        if preset in LLAMA_PRESET_DEFAULTS:
+            return preset
+        # Compatibility with the already deployed 0.6.0 worker, which did not
+        # report a preset for the only llama.cpp model it could load.
+        name = str(model.get("name") or model.get("id") or "").lower()
+        if model.get("backend") == "llama_cpp" and ("qwen3.8-27b" in name or "qwen3.8-27b-ud" in name):
+            return "qwen38_27b"
+        return None
+
+    def model_matches_config(worker, config):
+        model = worker.get("model") if isinstance(worker, dict) else None
+        if not isinstance(model, dict) or model.get("status") != "ready":
+            return False
+        backend = config.get("backend", "strata")
+        if backend != "llama_cpp":
+            return model.get("backend") in (None, backend)
+        return model.get("backend") == "llama_cpp" and worker_model_preset(worker) == config.get("llama_preset", "qwen38_27b")
+
+    def ready(worker, config=None):
+        base = (online(worker) and worker.get("status") in ("online", "idle", "ready")
+                and isinstance(worker.get("model"), dict) and worker["model"].get("status") == "ready")
+        return base and (config is None or model_matches_config(worker, config))
 
     runtime_active = {"queued_local", "submitting", "waiting_worker", "unknown",
                       "loading_model", "verifying_model", "stop_requested", "stopping"}
@@ -618,7 +718,7 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
         return "sk-strata-runtime-" + signature
 
     def runtime_session_maybe_live(item):
-        return (item.get("state") in ("ready", "model_stopped", "failed")
+        return (item.get("state") in ("ready", "model_stopped", "model_switch_required", "failed")
                 and item.get("kernel_status") in ("submitted", "queued", "starting", "running"))
 
     def has_command(c, action):
@@ -629,6 +729,21 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             except (json.JSONDecodeError, AttributeError):
                 continue
         return False
+
+    def has_model_command(c):
+        return any(has_command(c, action) for action in ("load_model", "switch_model", "stop_model"))
+
+    def model_load_action(worker, config):
+        if ready(worker) and not model_matches_config(worker, config):
+            # switch_model is deliberately limited to targets handled by the
+            # fixed llama.cpp preset switcher.  A ready llama.cpp process must
+            # not be torn down implicitly when the saved target is Strata;
+            # that transition keeps the existing two-step stop, then load
+            # contract exposed by the admin API.
+            if config.get("backend") != "llama_cpp":
+                return None
+            return "switch_model"
+        return "load_model"
 
     def cancel_pending_before_shutdown(c, worker_id):
         now = time.time()
@@ -662,8 +777,10 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             state = "stopping" if online(worker) else "stop_requested"
         elif online(worker) and stored_state in ("failed", "verifying_model", "model_stopped"):
             state = stored_state
-        elif ready(worker):
+        elif ready(worker, config):
             state = "ready"
+        elif ready(worker):
+            state = "model_switch_required"
         elif online(worker):
             state = "loading_model"
         elif not configured:
@@ -682,6 +799,7 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             "loading_model": "Worker 已连接，正在自动加载模型",
             "verifying_model": "模型加载命令已完成，等待 Worker 确认就绪",
             "model_stopped": "Worker 在线，模型已按要求停止",
+            "model_switch_required": "当前模型与所选预设不同，请切换模型",
             "ready": "模型已就绪",
             "stop_requested": "已请求停止；Worker 上线后会立即退出",
             "stopping": "正在结束 Worker 和模型",
@@ -723,7 +841,7 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             item = runtime_row(c)
             if item.get("stop_requested") or item.get("state") in ("stop_requested", "stopping"):
                 return runtime_snapshot(c), 202
-            if ready(worker):
+            if ready(worker, config):
                 c.execute("UPDATE runtime_state SET state='ready',stop_requested=0,error=NULL,updated_at=? WHERE id=1", (now,))
                 return runtime_snapshot(c), 200
             if runtime_session_maybe_live(item) and not online(worker):
@@ -736,8 +854,11 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                 if not supports(worker, config["backend"]):
                     raise HTTPException(409, "当前 Worker 不支持已选择的运行后端")
                 operation_id = item.get("operation_id") or secrets.token_hex(16)
-                if not has_command(c, "load_model"):
-                    add_job(c, "command", {"action": "load_model", "settings": config}, worker["worker_id"])
+                action = model_load_action(worker, config)
+                if action is None:
+                    raise HTTPException(409, "切换到 Strata 前请先停止当前模型")
+                if not has_model_command(c):
+                    add_job(c, "command", {"action": action, "settings": config}, worker["worker_id"])
                 c.execute("UPDATE runtime_state SET operation_id=?,state='loading_model',requested_by=?,"
                           "requested_at=COALESCE(requested_at,?),updated_at=?,stop_requested=0,error=NULL WHERE id=1",
                           (operation_id, requested_by, now, now))
@@ -847,6 +968,7 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             sweep(c)
             item = runtime_row(c)
             worker = current_worker(c)
+            config = settings(c)
             now = time.time()
             if item.get("state") not in runtime_active and not runtime_session_maybe_live(item):
                 return
@@ -857,9 +979,9 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                         add_job(c, "command", {"action": "shutdown", "settings": settings(c)}, worker["worker_id"])
                     c.execute("UPDATE runtime_state SET state='stopping',updated_at=? WHERE id=1", (now,))
                     return
-            elif online(worker) and item.get("state") in ("failed", "model_stopped"):
+            elif online(worker) and item.get("state") in ("failed", "model_stopped", "model_switch_required"):
                 return
-            elif ready(worker):
+            elif ready(worker, config):
                 c.execute("UPDATE runtime_state SET state='ready',kernel_status='running',error=NULL,updated_at=? WHERE id=1", (now,))
                 return
             elif online(worker):
@@ -870,8 +992,15 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                     return
                 config = enable_auto_load(c)
                 model_status = (worker.get("model") or {}).get("status") if isinstance(worker.get("model"), dict) else None
-                if model_status not in ("loading", "starting") and not has_command(c, "load_model") and supports(worker, config["backend"]):
-                    add_job(c, "command", {"action": "load_model", "settings": config}, worker["worker_id"])
+                if (model_status not in ("loading", "starting") and not has_model_command(c)
+                        and supports(worker, config["backend"])):
+                    action = model_load_action(worker, config)
+                    if action is None:
+                        c.execute("UPDATE runtime_state SET state='model_switch_required',kernel_status='running',"
+                                  "error=NULL,updated_at=? WHERE id=1", (now,))
+                        log(c, "切换到 Strata 前需要先停止当前 llama.cpp 模型", "warning")
+                        return
+                    add_job(c, "command", {"action": action, "settings": config}, worker["worker_id"])
                 c.execute("UPDATE runtime_state SET state='loading_model',kernel_status='running',updated_at=? WHERE id=1", (now,))
                 return
             # queued_local is owned by the next loop iteration, while
@@ -907,12 +1036,12 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             if official_status in ("queued", "starting", "running"):
                 if item.get("stop_requested"):
                     state, error = "stop_requested", item.get("error")
-                elif item.get("state") in ("model_stopped", "failed"):
+                elif item.get("state") in ("model_stopped", "model_switch_required", "failed"):
                     state, error = item.get("state"), item.get("error")
                 else:
                     state, error = "waiting_worker", None
             elif official_status in ("complete", "cancelled"):
-                if item.get("stop_requested") or item.get("state") in ("ready", "loading_model", "verifying_model", "model_stopped", "stopping"):
+                if item.get("stop_requested") or item.get("state") in ("ready", "loading_model", "verifying_model", "model_stopped", "model_switch_required", "stopping"):
                     state, error = "stopped", None
                 elif item.get("state") == "failed":
                     state, error = "failed", item.get("error") or failure or "Kaggle Notebook 运行失败后结束"
@@ -1128,12 +1257,37 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
         patch = body.model_dump(exclude_none=True)
         with db() as c:
             config = settings(c)
+            old_backend = config.get("backend", "llama_cpp")
+            old_preset = config.get("llama_preset", "qwen38_27b")
+            new_backend = patch.get("backend", old_backend)
+            new_preset = patch.get("llama_preset", old_preset)
+            if new_preset != old_preset:
+                old_defaults = LLAMA_PRESET_DEFAULTS[old_preset]
+                new_defaults = LLAMA_PRESET_DEFAULTS[new_preset]
+                for field, target in new_defaults.items():
+                    incoming = patch.get(field, config.get(field))
+                    if (incoming == config.get(field)
+                            and config.get(field) in (old_defaults.get(field), DEFAULT_SETTINGS.get(field))):
+                        patch[field] = target
+                # A manually pinned model/projector path belongs to the old
+                # preset. Switching always returns to exact fixed discovery.
+                patch["llama_model_path"] = ""
+                patch["llama_mmproj_path"] = ""
             config.update(patch)
             effective_batch = config["llama_batch_size"] or (256 if config["llama_context_length"] <= 131072 else 128)
             if config["llama_ubatch_size"] > effective_batch:
                 raise HTTPException(422, "ubatch 不能大于 batch")
             c.execute("UPDATE settings SET value=? WHERE id=1", (json.dumps(config),))
-            log(c, "管理配置已更新")
+            target_changed = new_backend != old_backend or new_preset != old_preset
+            worker = current_worker(c)
+            runtime = runtime_row(c)
+            if (target_changed and ready(worker) and not has_model_command(c)
+                    and not runtime.get("stop_requested")
+                    and runtime.get("state") not in ("stop_requested", "stopping")):
+                state = "ready" if model_matches_config(worker, config) else "model_switch_required"
+                c.execute("UPDATE runtime_state SET state=?,kernel_status='running',error=NULL,updated_at=? WHERE id=1",
+                          (state, time.time()))
+            log(c, "管理配置已更新" + ("；目标模型预设已切换为 " + new_preset if new_preset != old_preset else ""))
         return {"settings": config}
 
     @api.get("/api/keys", dependencies=[Depends(admin)])
@@ -1204,22 +1358,64 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                 "sum(CASE WHEN status='completed' THEN 1 ELSE 0 END) succeeded,"
                 "sum(CASE WHEN status IN ('failed','expired','cancelled') THEN 1 ELSE 0 END) failed,"
                 "avg(CASE WHEN duration_ms IS NOT NULL THEN duration_ms END) avg_duration_ms,"
+                "avg(CASE WHEN started_at>=created_at THEN (started_at-created_at)*1000 END) avg_queue_ms,"
+                "avg(CASE WHEN first_token_at>=started_at THEN (first_token_at-started_at)*1000 END) avg_ttft_ms,"
+                "avg(CASE WHEN completed_at>=first_token_at THEN (completed_at-first_token_at)*1000 END) avg_generation_ms,"
+                "avg(CASE WHEN model_decode_tokens>0 AND model_decode_ms>0 "
+                "THEN model_decode_tokens*1000.0/model_decode_ms END) avg_decode_tps,"
+                "avg(CASE WHEN completion_tokens>1 AND completed_at>first_token_at "
+                "THEN (completion_tokens-1)/(completed_at-first_token_at) END) avg_delivery_tps,"
                 "coalesce(sum(prompt_tokens),0) prompt_tokens,coalesce(sum(completion_tokens),0) completion_tokens,"
                 "coalesce(sum(total_tokens),0) total_tokens,coalesce(sum(cached_tokens),0) cached_tokens "
                 "FROM request_logs" + where, params).fetchone()
             rows = c.execute(
                 "SELECT job_id,source,api_key_id,api_key_name,api_key_prefix,model,status,created_at,completed_at,"
-                "duration_ms,prompt_tokens,completion_tokens,total_tokens,cached_tokens,error "
+                "started_at,first_token_at,duration_ms,prompt_tokens,completion_tokens,total_tokens,cached_tokens,"
+                "model_decode_tokens,model_decode_ms,error "
                 "FROM request_logs" + where + " ORDER BY created_at DESC LIMIT ?", (*params, limit)).fetchall()
         calls = summary_row["calls"] or 0
         succeeded = summary_row["succeeded"] or 0
+        avg_decode_tps = (round(summary_row["avg_decode_tps"], 2)
+                          if summary_row["avg_decode_tps"] is not None else None)
+        avg_delivery_tps = (round(summary_row["avg_delivery_tps"], 2)
+                            if summary_row["avg_delivery_tps"] is not None else None)
         summary = {"calls": calls, "succeeded": succeeded, "failed": summary_row["failed"] or 0,
                    "success_rate": round(succeeded * 100 / calls, 1) if calls else 0.0,
                    "avg_duration_ms": round(summary_row["avg_duration_ms"] or 0),
+                   "avg_queue_ms": (round(summary_row["avg_queue_ms"])
+                                    if summary_row["avg_queue_ms"] is not None else None),
+                   "avg_ttft_ms": (round(summary_row["avg_ttft_ms"])
+                                   if summary_row["avg_ttft_ms"] is not None else None),
+                   "avg_generation_ms": (round(summary_row["avg_generation_ms"])
+                                         if summary_row["avg_generation_ms"] is not None else None),
+                   "avg_decode_tps": avg_decode_tps, "avg_delivery_tps": avg_delivery_tps,
+                   "avg_output_tps": avg_decode_tps if avg_decode_tps is not None else avg_delivery_tps,
+                   "output_tps": avg_decode_tps if avg_decode_tps is not None else avg_delivery_tps,
                    "prompt_tokens": summary_row["prompt_tokens"],
                    "completion_tokens": summary_row["completion_tokens"],
                    "total_tokens": summary_row["total_tokens"], "cached_tokens": summary_row["cached_tokens"]}
-        items = [dict(row) for row in rows]
+        items = []
+        for row in rows:
+            item = dict(row)
+            created_at = item.get("created_at")
+            started_at = item.get("started_at")
+            first_token_at = item.get("first_token_at")
+            completed_at = item.get("completed_at")
+            item["queue_ms"] = (round((started_at - created_at) * 1000)
+                                if started_at is not None and created_at is not None and started_at >= created_at else None)
+            item["ttft_ms"] = (round((first_token_at - started_at) * 1000)
+                               if first_token_at is not None and started_at is not None and first_token_at >= started_at else None)
+            item["generation_ms"] = (round((completed_at - first_token_at) * 1000)
+                                     if completed_at is not None and first_token_at is not None and completed_at >= first_token_at else None)
+            item["delivery_ms"] = item["generation_ms"]
+            item["decode_ms"] = round(item["model_decode_ms"]) if item.get("model_decode_ms") is not None else None
+            item["decode_tps"] = (round(item["model_decode_tokens"] * 1000 / item["model_decode_ms"], 2)
+                                  if item.get("model_decode_tokens") and item.get("model_decode_ms") else None)
+            item["delivery_tps"] = (round((item["completion_tokens"] - 1) / (completed_at - first_token_at), 2)
+                                    if (item["completion_tokens"] > 1 and completed_at is not None
+                                        and first_token_at is not None and completed_at > first_token_at) else None)
+            item["output_tps"] = item["decode_tps"] if item["decode_tps"] is not None else item["delivery_tps"]
+            items.append(item)
         return {"period": period, "summary": summary, "rows": items}
 
     @api.get("/api/kaggle-quotas", dependencies=[Depends(admin)])
@@ -1263,20 +1459,36 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             c.execute("BEGIN IMMEDIATE")
             sweep(c)
             worker = current_worker(c)
+            config = settings(c)
             if not online(worker):
                 raise HTTPException(503, "Kaggle Worker 离线，请先运行接入 Notebook")
-            if kind == "chat" and not ready(worker):
+            if kind == "chat" and (has_model_command(c) or runtime_row(c).get("state") in ("loading_model", "verifying_model")):
+                raise HTTPException(503, "模型正在加载或切换，请稍后再试")
+            if kind == "chat" and not ready(worker, config):
+                if ready(worker):
+                    raise HTTPException(503, "当前模型与管理面板所选预设不同，请先切换模型")
                 raise HTTPException(503, "模型尚未加载完成")
             if c.execute("SELECT count(*) FROM jobs WHERE status IN ('pending','running')").fetchone()[0] >= 4:
                 raise HTTPException(429, "任务队列已满，请等待当前任务完成")
             if kind == "command":
-                payload["settings"] = settings(c)
-                if payload["action"] == "load_model" and not supports(worker, payload["settings"]["backend"]):
+                payload["settings"] = config
+                action = payload["action"]
+                if action in ("load_model", "switch_model") and not supports(worker, config["backend"]):
                     raise HTTPException(409, "当前 Kaggle Worker 版本不支持所选运行后端；请重新下载接入 Notebook，更新 Kaggle 中的 Worker 单元后再运行")
-                if payload["action"] == "load_model":
+                if action in ("load_model", "switch_model"):
                     runtime = runtime_row(c)
                     if runtime.get("stop_requested"):
                         raise HTTPException(409, "算力正在停止，不能重新加载模型")
+                    if has_model_command(c):
+                        raise HTTPException(409, "已有模型加载、切换或停止操作正在执行")
+                    if ready(worker):
+                        if model_matches_config(worker, config):
+                            raise HTTPException(409, "当前已加载所选模型")
+                        if config["backend"] != "llama_cpp":
+                            raise HTTPException(409, "切换到 Strata 前请先停止当前模型")
+                        payload["action"] = "switch_model"
+                    elif action == "switch_model":
+                        payload["action"] = "load_model"
                     c.execute("UPDATE runtime_state SET state='loading_model',error=NULL,updated_at=? WHERE id=1",
                               (time.time(),))
             else:
@@ -1284,7 +1496,7 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                 if payload.get("model") not in ("strata", model_name):
                     raise HTTPException(404, "当前模型名称不匹配，请查询 /v1/models")
                 if messages_have_images(payload.get("messages")) and worker["model"].get("vision") is not True:
-                    raise HTTPException(409, "当前模型未加载视觉投影；请确认私有 Dataset 包含 mmproj-F16.gguf，重新加载模型后再发送图片")
+                    raise HTTPException(409, "当前模型未加载配套视觉投影；请在管理面板切换到视觉预设后再发送图片")
                 payload["model"] = model_name or "strata"
                 # New workers always consume llama.cpp as SSE and upload ordered
                 # chunks. Older workers still force non-streaming locally.
@@ -1426,7 +1638,11 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             elif runtime.get("state") == "model_stopped":
                 pass
             elif model_status == "ready":
-                c.execute("UPDATE runtime_state SET state='ready',kernel_status='running',error=NULL,updated_at=? WHERE id=1", (now,))
+                worker = {**value, "worker_id": body.worker_id, "last_seen": now}
+                if model_matches_config(worker, config):
+                    c.execute("UPDATE runtime_state SET state='ready',kernel_status='running',error=NULL,updated_at=? WHERE id=1", (now,))
+                else:
+                    c.execute("UPDATE runtime_state SET state='model_switch_required',kernel_status='running',error=NULL,updated_at=? WHERE id=1", (now,))
             elif runtime.get("state") == "verifying_model" and model_status == "error":
                 c.execute("UPDATE runtime_state SET state='failed',error=?,updated_at=? WHERE id=1",
                           ("Worker 报告模型加载后状态异常", now))
@@ -1463,8 +1679,9 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             if not row:
                 return {"job": None}
             token = secrets.token_urlsafe(32)
-            c.execute("UPDATE jobs SET status='running',lease_hash=?,updated_at=? WHERE id=?", (digest(token), time.time(), row["id"]))
-            update_request_log(c, row["id"], "running")
+            started_at = time.time()
+            c.execute("UPDATE jobs SET status='running',lease_hash=?,updated_at=? WHERE id=?", (digest(token), started_at, row["id"]))
+            update_request_log(c, row["id"], "running", now=started_at)
             log(c, "Worker 开始任务：" + row["id"][:8])
             return {"job": {"id": row["id"], "type": row["type"], "payload": json.loads(row["payload"]), "lease_token": token, "expires_at": row["expires_at"]}}
 
@@ -1501,8 +1718,11 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                                      "FROM job_stream_batches WHERE job_id=?", (job_id,)).fetchone()[0]
             if stored_bytes + encoded_bytes > STREAM_JOB_MAX_BYTES:
                 raise HTTPException(413, "流式任务累计数据过大")
+            batch_at = time.time()
             c.execute("INSERT INTO job_stream_batches(job_id,seq,payload,created_at) VALUES(?,?,?,?)",
-                      (job_id, body.seq, encoded, time.time()))
+                      (job_id, body.seq, encoded, batch_at))
+            c.execute("UPDATE request_logs SET first_token_at=COALESCE(first_token_at,?) WHERE job_id=?",
+                      (batch_at, job_id))
             return {"ok": True, "cancel_requested": False, "next_seq": body.seq + 1}
 
     @api.post("/worker/jobs/{job_id}/result", dependencies=[Depends(worker_auth)])
@@ -1542,7 +1762,7 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             c.execute("UPDATE jobs SET status=?,result=?,error=?,updated_at=?,payload='{}' WHERE id=?",
                       (final_status, json.dumps(final_result, ensure_ascii=False) if final_result is not None else None, error, completed_at, job_id))
             update_request_log(c, job_id, final_status, result=final_result, error=error, now=completed_at)
-            if row["type"] == "command" and job_payload.get("action") == "load_model":
+            if row["type"] == "command" and job_payload.get("action") in ("load_model", "switch_model"):
                 if final_status != "completed":
                     c.execute("UPDATE runtime_state SET state='failed',error=?,updated_at=? WHERE id=1",
                               (error or "模型加载失败", completed_at))
@@ -1561,8 +1781,9 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
     def models():
         with db() as c:
             worker = current_worker(c)
+            config = settings(c)
         name = (worker.get("model") or {}).get("name") if worker else None
-        return {"object": "list", "data": [{"id": name or "strata", "object": "model", "created": int(start), "owned_by": "kaggle-worker"}] if ready(worker) else []}
+        return {"object": "list", "data": [{"id": name or "strata", "object": "model", "created": int(start), "owned_by": "kaggle-worker"}] if ready(worker, config) else []}
 
     async def wait_job(job_id, request):
         while True:

@@ -17,7 +17,10 @@ from typing import Any, Callable
 from agent.notebook import build_runtime_notebook
 
 
-KAGGLE_RUNTIME_DATASET = "job579/qwen3-8-27b-unsloth-q4-runtime"
+KAGGLE_RUNTIME_DATASETS = (
+    "job579/qwen3-8-27b-unsloth-q4-runtime",
+    "job579/ornith-1-5-35b-a3b-q4-runtime",
+)
 KAGGLE_RUNTIME_PUSH_TIMEOUT = 120
 KAGGLE_RUNTIME_STATUS_TIMEOUT = 20
 KAGGLE_RUNTIME_SESSION_TIMEOUT = 3 * 60 * 60
@@ -111,7 +114,7 @@ class KaggleRuntimeClient:
             "enable_gpu": True,
             "enable_tpu": False,
             "enable_internet": True,
-            "dataset_sources": [KAGGLE_RUNTIME_DATASET],
+            "dataset_sources": list(KAGGLE_RUNTIME_DATASETS),
             "competition_sources": [],
             "kernel_sources": [],
             "model_sources": [],

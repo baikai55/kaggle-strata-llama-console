@@ -289,7 +289,7 @@ code,pre{font-family:'SFMono-Regular',Consolas,'Liberation Mono',monospace;lette
 .request-period{min-height:31px;padding:5px 11px;border:0;border-radius:5px;background:none;color:var(--muted);font-size:10px}
 .request-period:hover{color:var(--text);background:#182535}
 .request-period.active{color:var(--accent);background:#18372f;font-weight:600}
-.request-metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px;margin-bottom:20px}
+.request-metric-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:13px;margin-bottom:20px}
 .request-metric-card{position:relative;min-height:126px;padding:18px 19px;background:linear-gradient(145deg,#121c2a,#101824);border:1px solid var(--border-soft);border-radius:11px;overflow:hidden}
 .request-metric-card:after{content:'';position:absolute;right:-25px;bottom:-39px;width:92px;height:72px;border:1px solid #30445a;border-radius:50%;opacity:.32}
 .request-metric-card>span{display:block;color:#8ea2b9;font-size:10px;margin-bottom:13px}
@@ -300,15 +300,19 @@ code,pre{font-family:'SFMono-Regular',Consolas,'Liberation Mono',monospace;lette
 .request-metric-card.failure>strong{color:var(--danger)}
 .request-metric-card.failure:after{border-color:#b85d6a}
 .request-metric-card.cached>strong{color:#7dd9c1}
+.request-metric-card.throughput>strong{color:#79d8ff}
+.request-metric-card.throughput:after{border-color:#4a9fc6}
 .request-list-panel{padding-bottom:8px}
-.request-table{min-width:1110px}
+.request-table{min-width:1320px}
 .request-table th{padding-top:9px;padding-bottom:9px}
 .request-table td{vertical-align:top;padding-top:15px;padding-bottom:15px}
 .request-time strong,.request-origin strong,.request-tokens strong{display:block;color:#c7d6e6;font-size:10px;font-weight:500}
-.request-time small,.request-origin small,.request-tokens small,.request-detail small{display:block;color:var(--subtle);font-size:9px;margin-top:4px;line-height:1.55}
+.request-time small,.request-origin small,.request-tokens small,.request-performance small,.request-detail small{display:block;color:var(--subtle);font-size:9px;margin-top:4px;line-height:1.55}
 .request-origin{min-width:150px}
 .request-model{max-width:190px;overflow:hidden;text-overflow:ellipsis}
 .request-duration,.request-cached{font-family:Consolas,monospace;color:#b7cadc!important}
+.request-performance{min-width:150px;font-family:Consolas,monospace}
+.request-performance strong{display:block;color:#79d8ff;font-size:11px;font-weight:600}
 .request-detail{max-width:250px}
 .request-detail code{font-size:9px;color:#84a5c0}
 .request-error{color:var(--danger)!important;white-space:normal;overflow-wrap:anywhere}

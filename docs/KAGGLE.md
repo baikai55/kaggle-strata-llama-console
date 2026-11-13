@@ -1,8 +1,8 @@
 # Kaggle 接入与模型准备
 
-核对日期：2026-11-13（Asia/Hong_Kong）。控制台先部署，再接 Worker；模型本机实测与经管理站外网调用分别验收。
+核对日期：2026-11-14（Asia/Hong_Kong）。控制台先部署，再接 Worker；模型本机实测与经管理站外网调用分别验收。
 
-## 0. 一键启动专用 Runtime（0.4.1）
+## 0. 一键启动专用 Runtime（0.7.2）
 
 一键启动使用固定私有 Kaggle Code，例如 `job579/kaggle-strata-console-runtime`。它是由服务器通过 Kaggle 官方 `kernels push/status` 管理的 Commit Run，不是远程操作现有交互式 Draft Session。HTTP 请求不能修改 Notebook slug、加速器、Dataset、代码或命令。
 
@@ -20,10 +20,10 @@ KAGGLE_RUNTIME_ACCELERATOR=NvidiaTeslaT4
 
 首次设置只做一次：
 
-1. 在已部署的 `0.4.1` 源码环境中调用 Runtime 创建流程的 `no_run=True` 模式，创建上述专用私有 Notebook，但不消耗 GPU 启动运行。这个模板使用无效占位凭据，不能作为真实 Worker 运行。
-2. 核对 Code 为 Private、Internet 开启、GPU 为 T4 ×2，并只挂载 `job579/qwen3-8-27b-unsloth-q4-runtime`。一键启动无需在 **Add-ons → Secrets** 授权 `STRATA_WORKER_KEY`。
+1. 在已部署的 `0.7.2` 源码环境中调用 Runtime 创建流程的 `no_run=True` 模式，创建上述专用私有 Notebook，但不消耗 GPU 启动运行。这个模板使用无效占位凭据，不能作为真实 Worker 运行。
+2. 核对 Code 为 Private、Internet 开启、GPU 为 T4 ×2，并固定挂载 `job579/qwen3-8-27b-unsloth-q4-runtime` 与 `job579/ornith-1-5-35b-a3b-q4-runtime`。一键启动无需在 **Add-ons → Secrets** 授权 `STRATA_WORKER_KEY`。
 3. 如需手动 Notebook 调试或回退，再单独在 **Add-ons → Secrets** 授权长期 `STRATA_WORKER_KEY`；该授权不属于一键启动控制链。
-4. 回到管理站执行一次真实启动验收。Worker 在线后应自动加载已保存的模型配置，再验证对话、API 和停止。
+4. 回到管理站保存 `qwen38_27b`、`ornith_35b_a3b`（高速文本）或 `ornith_35b_a3b_vision`（视觉）预设，再执行一次真实启动验收。Worker 在线后应自动加载所选模型配置，再验证对话、API、切换和停止。
 
 每次启动会创建新的 operation 和约 20 分钟有效的一次性 bootstrap token，并把它仅放入本次 Push 的 Runtime Notebook。Notebook 通过 HTTPS 调用 `POST /worker/bootstrap`，校验 operation 后换取本次运行的临时 Worker session token；bootstrap 首次成功兑换后只保留约 60 秒幂等重试窗，session 有效期约为 3 小时运行上限加 10 分钟停止宽限。新 operation、确定提交失败、官方终止、Worker stopped 或管理站停止收敛时都会清理对应临时认证。
 
@@ -35,7 +35,7 @@ KAGGLE_RUNTIME_ACCELERATOR=NvidiaTeslaT4
 
 停止有两种情况：尚未提交的本地操作可直接取消；Kaggle 已接收后没有官方硬取消接口，管理站会显示停止已请求，等待 Worker 上线后立即执行 `shutdown`，不再自动加载。Worker 退出后 Commit Run 自然结束，最终仍应在 Kaggle 页面和官方配额页确认 GPU 已释放。
 
-## 当前主线：已验证的 llama.cpp 私有 Dataset
+## 当前主线：两套固定 llama.cpp 私有 Dataset
 
 - 私有 Dataset：`job579/qwen3-8-27b-unsloth-q4-runtime`。
 - 模型：Unsloth `Qwen3.8-27B-UD-Q4_K_M`，GGUF 精确大小 16,564,259,744 bytes。
@@ -45,7 +45,16 @@ KAGGLE_RUNTIME_ACCELERATOR=NvidiaTeslaT4
 - 一次真实冷启动观测为端到端约 4 分 22 秒，其中 GPU/Dataset 就绪约 72 秒、模型加载约 44 秒；Kaggle 排队、共享缓存命中和 Input 挂载没有 SLA，不能把该数字写成保证。
 - 原 88.88GB RVN Strata 方案加载约 14 分钟仍未 ready，随机 I/O 极慢，不满足“5 分钟以内、随开随用”，不再作为默认；Strata 仅保留兼容后端。
 
-使用时在 Notebook 的 **Add Input → Datasets** 挂载上述 Dataset，运行控制台生成的接入 Notebook。管理页选择 `llama.cpp` 后，GGUF、视觉投影与 `llama-server` 路径通常留空；Worker 会校验固定 Dataset、模型大小、投影大小/SHA/来源提交、运行清单和 llama.cpp commit。然后使用 128K、Q8_0、batch 256、ubatch 64、双卡 `1,1` 加载。模型状态显示 `vision=true` 或页面显示“可识图”后才能发送图片。
+Ornith 使用同一主模型提供两个固定预设：`ornith_35b_a3b`（高速文本）与 `ornith_35b_a3b_vision`（视觉）：
+
+- 私有 Dataset：`job579/ornith-1-5-35b-a3b-q4-runtime`。
+- 主文件：`Ornith-1.5-35B-Q4_K_M.gguf`，21,713,463,040 bytes；固定来源 commit `12393612fd4f730ff5aadc23e9b8f9648aa49ceb`。
+- 视觉投影：`mmproj-Ornith-1.5-35B-BF16.gguf`，902,822,240 bytes；Dataset 同时保存来源与 SHA-256 清单。高速文本预设不附加，视觉预设自动校验并加载。
+- 纯文本 `llama-server` smoke 实测 200-token decode 为 70.717 tok/s。此前含投影正式进程显示的 4.648 tok/s 后来确认是 Worker 控制面逐 token POST 导致的端到端交付速度，不是 llama.cpp decode；需要看图时在面板显式切换视觉预设，真图片速度仍按 0.7.2 的 decode、delivery 与 TTFT 分项验收。
+
+专用 Runtime 固定同时挂载 Qwen 与 Ornith Dataset。未加载的模型只占 Kaggle Input，不进入 RAM/显存；Worker 永远从 Qwen Runtime Dataset 使用已验证的 `llama-server`。管理面板保存 preset 后，可以在同一 Worker 会话中执行 Qwen ↔ Ornith 切换：切换排队后拒绝新聊天，等待既有任务结束，先停止旧模型，再加载目标模型。llama.cpp 与 Strata 之间仍须先显式停止，不能直接切换。
+
+使用时在 Notebook 的 **Add Input → Datasets** 同时挂载上述两套 Dataset，运行控制台生成的接入 Notebook。管理页选择 `llama.cpp` 和目标预设后，GGUF、视觉投影与 `llama-server` 路径通常留空；Worker 会按 preset 校验固定 Dataset、模型大小、运行清单和 llama.cpp commit。Qwen 与 Ornith 视觉预设自动加载配套投影；Ornith 高速文本预设不加载。然后按预设默认值使用 128K、Q8_0、双卡 `1,1` 加载。
 
 ### 视觉输入与验收边界
 
@@ -53,14 +62,15 @@ KAGGLE_RUNTIME_ACCELERATOR=NvidiaTeslaT4
 - 每次请求最多 4 张图片；单张及全部图片的解码字节受 2 MiB 限制，边长不超过 8192 像素，总像素不超过 32 MiP。浏览器会先压缩预览，服务端仍独立验证 MIME、Base64、文件魔数和尺寸。
 - mmproj 未加载时服务端在入队前返回 409，提示重新核对 Dataset 和加载模型；不要把 llama.cpp 的 `image input is not supported` 500 当成最终用户错误。
 - `0.6.0` 真机验收使用固定 Runtime 和 128K 配置：Worker 心跳报告 `vision=true`；一张 64×64 左红右蓝 PNG 经 `POST /v1/chat/completions` 非流式调用，HTTP 200，2.693 秒返回“左红右蓝”。任务完成后 SQLite payload 为 `{}`。验收结束后 Runtime 为 `stopped/complete`，Kaggle 官方状态为 `COMPLETE`。
+- `0.7.2` 又在 Ornith 视觉预设上使用同类 64×64 左红右蓝 PNG 完成验收：Worker 报告 `vision=true`，回答“图片左半部分是红色，右半部分是蓝色”；该请求 llama.cpp decode 为 75 tokens / 1063.149 ms（监控口径 70.55 tok/s），交付 78.31 tok/s。相同视觉进程的 400-token 纯文本请求 decode 为 67.11 tok/s、交付 71.44 tok/s，证明此前 4.x 是 Worker 逐 token POST，而不是 mmproj 回退。
 
 ## 1. 从已有 Models 或 Datasets 挂载模型
 
-在私有 Notebook 的 **Add Input → Datasets** 挂载当前固定 Dataset。当前 Kaggle 页面实测挂载根为 `/kaggle/input/datasets/job579/qwen3-8-27b-unsloth-q4-runtime/...`；Worker 同时兼容旧式 `/kaggle/input/qwen3-8-27b-unsloth-q4-runtime/...`，但不会搜索其他 Dataset。持久 Dataset 无需每次从原始站点重新导入。Kaggle 官方说明，Notebook Input 使用共享资源缓存，不占用虚拟机本地磁盘；这不保证每次新会话立即完成挂载。不能把 `Adding data` 直接等同于完整复制到新虚拟机，也不能承诺下次没有等待。
+在私有 Notebook 的 **Add Input → Datasets** 挂载两套固定 Dataset。当前 Kaggle 页面实测挂载根使用 `/kaggle/input/datasets/job579/<slug>/...`；Worker 同时兼容旧式 `/kaggle/input/<slug>/...`，但不会搜索其他 Dataset。持久 Dataset 无需每次从原始站点重新导入。Kaggle 官方说明，Notebook Input 使用共享资源缓存，不占用虚拟机本地磁盘；这不保证每次新会话立即完成挂载。不能把 `Adding data` 直接等同于完整复制到新虚拟机，也不能承诺下次没有等待。
 
 官方依据：[Kaggle/kagglehub README](https://github.com/Kaggle/kagglehub/blob/03c1f544fb5e87019f5d77e4fc129455aa573278/README.md#L7-L12)。共享缓存保留时长、跨会话命中保证和当前下载横幅刷新粒度均未取得官方承诺。冷启动须分别记录 GPU 分配、Input 挂载、安装准备、模型加载和首个完整回答的耗时。
 
-当前 llama.cpp 主线使用已固定并实测的单文件 GGUF，可直接由 Worker 启动。若切换到 Strata，仍需核对模型架构、版本、完整分片、tokenizer 和 Strata pack；普通 Transformers/safetensors 模型或任意 GGUF 不能直接当作 Strata 配置。
+当前 llama.cpp 主线使用两个白名单单文件 GGUF 预设，可直接由 Worker 启动或原子切换。若切换到 Strata，仍需先停止当前 llama 模型，并核对模型架构、版本、完整分片、tokenizer 和 Strata pack；普通 Transformers/safetensors 模型或任意 GGUF 不能直接当作 Strata 配置。
 
 旧 [RVN Qwen3.8-Flash-Next IQ3_S Strata 包](https://huggingface.co/jimmy31chen/RVN-Qwen3.8-Flash-Next-Abliterated-Uncensored-IQ3_S-Strata) 的导入与失败诊断保留为历史证据，但不再是当前默认。Worker 不下载大模型，也不会自动启用实验性投影。
 
@@ -181,7 +191,7 @@ Kaggle 官方公开 API 当前没有 Private Datasets / Private Models 存储配
 
 ## 8. 退出与验证边界
 
-Worker 默认空闲 5 分钟停止、总运行最多 3 小时（包括加载与推理）。控制台失联约 45 秒也停止模型。队列中的停止/结束命令会等当前任务结束；交互式 Notebook 需要立即停止时可在 Kaggle 中断运行单元。管理站可提交固定专用 Commit Run，但不能启动或硬停止交互式 Draft Session，也不能硬取消 Kaggle 已接收的 Commit Run。**Worker 退出不等于已经确认 Kaggle 释放 GPU，请在 Kaggle 页面确认运行结束并检查配额。**不会模拟活跃或自动重开会话规避平台限制。
+手动 Worker 默认空闲 8 分钟停止、总运行最多 3 小时（包括加载与推理）；管理站启动的托管 Runtime 将空闲上限提升到同一 3 小时硬上限。控制台失联约 45 秒也停止模型。队列中的停止/结束命令会等当前任务结束；交互式 Notebook 需要立即停止时可在 Kaggle 中断运行单元。管理站可提交固定专用 Commit Run，但不能启动或硬停止交互式 Draft Session，也不能硬取消 Kaggle 已接收的 Commit Run。**Worker 退出不等于已经确认 Kaggle 释放 GPU，请在 Kaggle 页面确认运行结束并检查配额。**不会模拟活跃或自动重开会话规避平台限制。
 
 普通聊天和模型列表请求不会启动或唤醒 Kaggle；只有管理站启动按钮或独立 Wake API 会提交专用 Runtime。手动流程曾观测完整冷启动约 4 分 22 秒；0.4.1 的一次真实 Commit Run 则约 8 分 22 秒，其中 Worker 接入前约 7 分 39 秒、接入后模型加载约 43 秒。差异主要来自 Kaggle 排队/GPU/Dataset 准备，这些都是现场观测，不是 Kaggle SLA。
 

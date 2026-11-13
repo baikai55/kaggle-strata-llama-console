@@ -72,7 +72,10 @@ def headers(config):
 
 
 def heartbeat(client, config, worker_id="worker-1", status="ready", model=True, logs=None, capabilities=None):
-    model_value = model if isinstance(model, dict) else ({"name": "test-model", "status": "ready"} if model else None)
+    model_value = ({"backend": "llama_cpp", "preset": "qwen38_27b", **model}
+                   if isinstance(model, dict) else
+                   ({"name": "test-model", "status": "ready", "backend": "llama_cpp",
+                     "preset": "qwen38_27b"} if model else None))
     payload = {"worker_id": worker_id, "status": status,
         "model": model_value, "metrics": {}, "logs": logs or []}
     if capabilities is not None:
@@ -167,6 +170,39 @@ def test_validation_does_not_echo_password(instance):
     r = c.put("/api/settings", json={"llama_mmproj_path": "/kaggle/input/datasets/job579/qwen3-8-27b-unsloth-q4-runtime/mmproj-F16.gguf"}, headers={"Origin": "http://testserver"})
     assert r.status_code == 200
     assert post_admin(c, "/api/agent/command", {"action": "shell", "cmd": "whoami"}).status_code == 422
+
+
+def test_llama_preset_settings_are_fixed_and_old_values_gain_default(instance):
+    c, cfg, app = instance
+    setup(c, cfg)
+    current = c.get("/api/settings").json()["settings"]
+    assert current["llama_preset"] == "qwen38_27b"
+    assert c.put("/api/settings", json={"llama_preset": "untrusted"},
+                 headers={"Origin": "http://testserver"}).status_code == 422
+
+    qwen_model = "/kaggle/input/datasets/job579/qwen3-8-27b-unsloth-q4-runtime/qwen38-model/Qwen3.8-27B-UD-Q4_K_M.gguf"
+    qwen_mmproj = "/kaggle/input/datasets/job579/qwen3-8-27b-unsloth-q4-runtime/mmproj-F16.gguf"
+    assert c.put("/api/settings", json={"llama_model_path": qwen_model,
+                                         "llama_mmproj_path": qwen_mmproj},
+                 headers={"Origin": "http://testserver"}).status_code == 200
+    switched = c.put("/api/settings", json={"llama_preset": "ornith_35b_a3b"},
+                     headers={"Origin": "http://testserver"})
+    assert switched.status_code == 200
+    saved = switched.json()["settings"]
+    assert saved["llama_preset"] == "ornith_35b_a3b"
+    assert saved["llama_alias"] == "ornith-1.5-35b-a3b"
+    assert saved["llama_model_path"] == "" and saved["llama_mmproj_path"] == ""
+
+    vision = c.put("/api/settings", json={"llama_preset": "ornith_35b_a3b_vision"},
+                   headers={"Origin": "http://testserver"})
+    assert vision.status_code == 200
+    assert vision.json()["settings"]["llama_preset"] == "ornith_35b_a3b_vision"
+
+    with sqlite3.connect(app.state.db_path) as db:
+        legacy = json.loads(db.execute("SELECT value FROM settings WHERE id=1").fetchone()[0])
+        legacy.pop("llama_preset", None)
+        db.execute("UPDATE settings SET value=? WHERE id=1", (json.dumps(legacy),))
+    assert c.get("/api/settings").json()["settings"]["llama_preset"] == "qwen38_27b"
 
 
 def test_image_messages_require_vision_and_only_accept_safe_data_uri(instance):
@@ -311,6 +347,96 @@ def test_backend_capabilities_and_auto_load(instance):
     assert job["payload"]["settings"]["backend"] == "llama_cpp"
 
 
+def test_online_llama_preset_switch_is_atomic_and_blocks_new_chat(instance):
+    c, cfg, app = instance
+    setup(c, cfg)
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model={
+        "name": "qwen3.8-27b", "status": "ready", "backend": "llama_cpp",
+        "preset": "qwen38_27b", "vision": True,
+    }).status_code == 200
+    switched = c.put("/api/settings", json={"llama_preset": "ornith_35b_a3b"},
+                     headers={"Origin": "http://testserver"})
+    assert switched.status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "model_switch_required"
+    with sqlite3.connect(app.state.db_path) as db:
+        assert db.execute("SELECT state FROM runtime_state WHERE id=1").fetchone()[0] == "model_switch_required"
+    blocked = post_admin(c, "/api/chat", {"messages": [{"role": "user", "content": "hello"}]})
+    assert blocked.status_code == 503 and "切换模型" in blocked.text
+
+    queued = post_admin(c, "/api/agent/command", {"action": "switch_model"})
+    assert queued.status_code == 200
+    still_blocked = post_admin(c, "/api/chat", {"messages": [{"role": "user", "content": "hello"}]})
+    assert still_blocked.status_code == 503 and "加载或切换" in still_blocked.text
+    duplicate = post_admin(c, "/api/agent/command", {"action": "switch_model"})
+    assert duplicate.status_code == 409
+    job = claim(c, cfg).json()["job"]
+    assert job["payload"]["action"] == "switch_model"
+    assert job["payload"]["settings"]["llama_preset"] == "ornith_35b_a3b"
+    assert finish(c, cfg, job, result={"message": "模型切换完成"}).status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "verifying_model"
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model={
+        "name": "ornith-1.5-35b-a3b", "status": "ready", "backend": "llama_cpp",
+        "preset": "ornith_35b_a3b", "vision": False,
+    }).status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "ready"
+
+    vision = c.put("/api/settings", json={"llama_preset": "ornith_35b_a3b_vision"},
+                   headers={"Origin": "http://testserver"})
+    assert vision.status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "model_switch_required"
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model={
+        "name": "ornith-1.5-35b-a3b", "status": "ready", "backend": "llama_cpp",
+        "preset": "ornith_35b_a3b_vision", "vision": True,
+    }).status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "ready"
+
+
+def test_switch_failure_is_reported_and_queued_settings_are_a_snapshot(instance):
+    c, cfg, _ = instance
+    setup(c, cfg)
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model={
+        "name": "qwen3.8-27b", "status": "ready", "backend": "llama_cpp",
+        "preset": "qwen38_27b",
+    }).status_code == 200
+    assert c.put("/api/settings", json={"llama_preset": "ornith_35b_a3b"},
+                 headers={"Origin": "http://testserver"}).status_code == 200
+    assert post_admin(c, "/api/agent/command", {"action": "load_model"}).status_code == 200
+    assert c.put("/api/settings", json={"llama_preset": "qwen38_27b"},
+                 headers={"Origin": "http://testserver"}).status_code == 200
+    job = claim(c, cfg).json()["job"]
+    assert job["payload"]["action"] == "switch_model"
+    assert job["payload"]["settings"]["llama_preset"] == "ornith_35b_a3b"
+    failed = finish(c, cfg, job, status="failed")
+    assert failed.status_code == 200
+    runtime = c.get("/api/runtime").json()
+    assert runtime["state"] == "failed" and runtime["last_error"]
+
+
+def test_runtime_start_and_wake_require_stopping_llama_before_strata(instance):
+    c, cfg, _ = instance
+    setup(c, cfg)
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model={
+        "name": "qwen3.8-27b", "status": "ready", "backend": "llama_cpp",
+        "preset": "qwen38_27b",
+    }).status_code == 200
+    assert c.put("/api/settings", json={"backend": "strata"},
+                 headers={"Origin": "http://testserver"}).status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "model_switch_required"
+
+    started = post_admin(c, "/api/runtime/start", {})
+    assert started.status_code == 409 and "先停止当前模型" in started.text
+    wake_key = post_admin(c, "/api/keys", {"name": "wake", "can_wake": True}).json()["key"]
+    woke = c.post("/v1/runtime/wake", headers={"Authorization": "Bearer " + wake_key})
+    assert woke.status_code == 409 and "先停止当前模型" in woke.text
+
+    # Neither path may enqueue the unsupported Strata-target switch command;
+    # the ready llama.cpp process remains reported until an explicit stop.
+    assert claim(c, cfg).json()["job"] is None
+    status = c.get("/api/status").json()
+    assert status["agent"]["model"]["status"] == "ready"
+    assert status["agent"]["model"]["backend"] == "llama_cpp"
+
+
 def test_new_capable_worker_auto_loads_once(instance):
     c, cfg, _ = instance
     setup(c, cfg)
@@ -372,7 +498,8 @@ def test_one_click_runtime_start_is_idempotent_and_auto_loads(tmp_path):
                           json={"worker_id": "worker-1", "lease_token": job["lease_token"],
                                 "status": "completed", "result": {"message": "模型加载完成"}})
         assert finished.status_code == 200
-        worker_payload.update(status="ready", model={"name": "test-model", "status": "ready"})
+        worker_payload.update(status="ready", model={"name": "test-model", "status": "ready",
+                                                     "backend": "llama_cpp", "preset": "qwen38_27b"})
         assert c.post("/worker/heartbeat", headers=runtime_headers, json=worker_payload).status_code == 200
         assert c.get("/api/status").json()["runtime"]["state"] == "ready"
         assert len(runtime.pushes) == 1
@@ -569,7 +696,7 @@ def test_stop_cancels_pending_auto_load_before_shutdown(tmp_path):
         with sqlite3.connect(app.state.db_path) as db:
             statuses = db.execute("SELECT status,payload FROM jobs ORDER BY created_at").fetchall()
         assert len(statuses) == 2
-        assert statuses[0][0] == "cancelled" and '"action": "load_model"' in statuses[0][1]
+        assert statuses[0] == ("cancelled", "{}")
         assert statuses[1][0] == "running" and '"action": "shutdown"' in statuses[1][1]
 
 
@@ -781,7 +908,7 @@ def test_official_error_after_stop_request_clears_stopping_state(tmp_path):
                        (old - 60, old, hashlib.sha256(b"bootstrap").hexdigest(), time.time() + 60,
                         time.time(), hashlib.sha256(old_session.encode()).hexdigest(), time.time() + 60))
 
-        wait_until(lambda: runtime.status_calls > 0)
+        wait_until(lambda: runtime.status_calls > 0, timeout=5)
         state = c.get("/api/runtime").json()
         assert state["state"] == "stopped"
         assert state["stop_requested"] is False
@@ -1105,16 +1232,107 @@ def test_request_monitoring_tracks_console_and_api_without_content(instance):
     assert not errors and not caller.is_alive() and box["response"].status_code == 200
 
     payload = c.get("/api/requests", params={"period": "all"}).json()
-    assert payload["summary"] == {"calls": 2, "succeeded": 2, "failed": 0, "success_rate": 100.0,
-                                  "avg_duration_ms": payload["summary"]["avg_duration_ms"],
-                                  "prompt_tokens": 120, "completion_tokens": 10, "total_tokens": 130,
-                                  "cached_tokens": 90}
+    summary = payload["summary"]
+    assert {key: summary[key] for key in (
+        "calls", "succeeded", "failed", "success_rate", "prompt_tokens",
+        "completion_tokens", "total_tokens", "cached_tokens",
+    )} == {"calls": 2, "succeeded": 2, "failed": 0, "success_rate": 100.0,
+           "prompt_tokens": 120, "completion_tokens": 10, "total_tokens": 130,
+           "cached_tokens": 90}
+    assert summary["avg_duration_ms"] >= 0 and summary["avg_queue_ms"] >= 0
+    assert summary["avg_ttft_ms"] is None and summary["avg_generation_ms"] is None
+    assert summary["avg_output_tps"] is None and summary["output_tps"] is None
     assert {row["job_id"] for row in payload["rows"]} == {console_id, public_job["id"]}
+    assert all(row["started_at"] is not None and row["queue_ms"] is not None for row in payload["rows"])
+    assert all(row["first_token_at"] is None and row["ttft_ms"] is None
+               and row["generation_ms"] is None and row["output_tps"] is None
+               for row in payload["rows"])
     api_rows = c.get("/api/requests", params={"period": "all", "source": "api", "q": "monitor-client"}).json()["rows"]
     assert len(api_rows) == 1 and api_rows[0]["api_key_name"] == "monitor-client"
     serialized = json.dumps(payload, ensure_ascii=False)
     assert created["key"] not in serialized and "do-not-store-console" not in serialized and "do-not-store-api" not in serialized
     assert c.get("/api/requests", params={"status": "invalid"}).status_code == 422
+
+
+def test_request_monitoring_records_stream_queue_ttft_and_decode_tps(instance):
+    c, cfg, app = instance
+    setup(c, cfg)
+    heartbeat(c, cfg)
+
+    job_id = post_admin(c, "/api/chat", {"messages": [{"role": "user", "content": "timing"}]}).json()["job_id"]
+    job = claim(c, cfg).json()["job"]
+    with sqlite3.connect(app.state.db_path) as db:
+        created_at, started_at = db.execute(
+            "SELECT created_at,started_at FROM request_logs WHERE job_id=?", (job_id,)).fetchone()
+    assert started_at is not None and started_at >= created_at
+
+    chunks = [{"id": "timed", "model": "test-model", "choices": [{
+        "index": 0, "delta": {"role": "assistant", "content": "首"}, "finish_reason": None}]}]
+    assert upload_chunks(c, cfg, job, 0, chunks).status_code == 200
+    with sqlite3.connect(app.state.db_path) as db:
+        first_token_at = db.execute(
+            "SELECT first_token_at FROM request_logs WHERE job_id=?", (job_id,)).fetchone()[0]
+    assert first_token_at is not None and first_token_at >= started_at
+    duplicate = upload_chunks(c, cfg, job, 0, chunks)
+    assert duplicate.status_code == 200 and duplicate.json()["duplicate"] is True
+    with sqlite3.connect(app.state.db_path) as db:
+        assert db.execute("SELECT first_token_at FROM request_logs WHERE job_id=?", (job_id,)).fetchone()[0] == first_token_at
+        anchor = time.time()
+        db.execute("UPDATE request_logs SET created_at=?,started_at=?,first_token_at=? WHERE job_id=?",
+                   (anchor - 4, anchor - 3, anchor - 2, job_id))
+
+    final_chunk = [{"id": "timed", "model": "test-model", "choices": [{
+        "index": 0, "delta": {"content": "二三四五"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        "timings": {"predicted_n": 5, "predicted_ms": 100.0}}]
+    assert upload_chunks(c, cfg, job, 1, final_chunk).status_code == 200
+
+    result = {"choices": [{"index": 0, "message": {"role": "assistant", "content": "首二三四五"},
+                           "finish_reason": "stop"}],
+              "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+    assert finish(c, cfg, job, result=result).status_code == 200
+    payload = c.get("/api/requests", params={"period": "all"}).json()
+    row = next(item for item in payload["rows"] if item["job_id"] == job_id)
+    assert row["queue_ms"] == 1000 and row["ttft_ms"] == 1000
+    assert 1900 <= row["generation_ms"] <= 3000 and row["delivery_ms"] == row["generation_ms"]
+    assert row["decode_ms"] == 100 and row["decode_tps"] == row["output_tps"] == 50.0
+    assert 1.3 <= row["delivery_tps"] <= 2.2
+    summary = payload["summary"]
+    assert summary["avg_queue_ms"] == 1000 and summary["avg_ttft_ms"] == 1000
+    assert 1900 <= summary["avg_generation_ms"] <= 3000
+    assert summary["avg_decode_tps"] == summary["avg_output_tps"] == summary["output_tps"] == 50.0
+    assert 1.3 <= summary["avg_delivery_tps"] <= 2.2
+
+
+def test_request_monitoring_migrates_legacy_timing_columns(tmp_path):
+    data_dir = tmp_path / "legacy-request-log"
+    data_dir.mkdir()
+    db_path = data_dir / "console.sqlite3"
+    with sqlite3.connect(db_path) as db:
+        db.execute("""CREATE TABLE request_logs(
+            job_id TEXT PRIMARY KEY, source TEXT NOT NULL, api_key_id TEXT,
+            api_key_name TEXT, api_key_prefix TEXT, model TEXT NOT NULL,
+            status TEXT NOT NULL, created_at REAL NOT NULL, completed_at REAL,
+            duration_ms INTEGER, prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_tokens INTEGER NOT NULL DEFAULT 0, error TEXT)""")
+        db.execute("INSERT INTO request_logs(job_id,source,model,status,created_at,completed_at,duration_ms,"
+                   "prompt_tokens,completion_tokens,total_tokens,cached_tokens) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                   ("legacy-job", "console", "legacy-model", "completed", 100.0, 102.0, 2000, 4, 2, 6, 0))
+
+    cfg = Config(data_dir, secrets.token_urlsafe(40), secrets.token_urlsafe(40), allowed_hosts="testserver")
+    app = create_app(cfg)
+    with TestClient(app) as c:
+        setup(c, cfg)
+        row = c.get("/api/requests", params={"period": "all"}).json()["rows"][0]
+        assert row["job_id"] == "legacy-job"
+        assert row["started_at"] is None and row["first_token_at"] is None
+        assert row["queue_ms"] is None and row["ttft_ms"] is None
+        assert row["generation_ms"] is None and row["output_tps"] is None
+    with sqlite3.connect(db_path) as db:
+        columns = {row[1] for row in db.execute("PRAGMA table_info(request_logs)")}
+    assert {"started_at", "first_token_at", "model_decode_tokens", "model_decode_ms"} <= columns
 
 
 def test_kaggle_quota_endpoint_requires_admin_and_handles_missing_token(instance):

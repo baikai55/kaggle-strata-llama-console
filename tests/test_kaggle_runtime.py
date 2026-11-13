@@ -6,7 +6,7 @@ import pytest
 
 from agent.notebook import build_runtime_notebook
 from app.kaggle_runtime import (
-    KAGGLE_RUNTIME_DATASET,
+    KAGGLE_RUNTIME_DATASETS,
     KAGGLE_RUNTIME_PUSH_TIMEOUT,
     KAGGLE_RUNTIME_SESSION_TIMEOUT,
     KAGGLE_RUNTIME_STATUS_TIMEOUT,
@@ -49,8 +49,8 @@ def test_runtime_notebook_executes_bootstrap_exchange_and_cleans_up(monkeypatch,
             calls["stop_event_set"] = True
 
     class FakeWorker:
-        def __init__(self, server_url, worker_key):
-            calls["worker_init"] = (server_url, worker_key)
+        def __init__(self, server_url, worker_key, *, idle_timeout):
+            calls["worker_init"] = (server_url, worker_key, idle_timeout)
             self.stop_event = FakeStopEvent()
 
         def run(self):
@@ -61,7 +61,7 @@ def test_runtime_notebook_executes_bootstrap_exchange_and_cleans_up(monkeypatch,
 
     def fake_run_path(path, run_name):
         calls["run_path"] = (path, run_name)
-        return {"Worker": FakeWorker}
+        return {"Worker": FakeWorker, "MAX_RUNTIME": 3 * 60 * 60}
 
     monkeypatch.setattr("requests.Session", FakeSession)
     monkeypatch.setattr("runpy.run_path", fake_run_path)
@@ -77,7 +77,7 @@ def test_runtime_notebook_executes_bootstrap_exchange_and_cleans_up(monkeypatch,
     }
     assert trust_env is False and calls["session_closed"] is True
     assert calls["run_path"] == (str(worker_file), "strata_console_runtime_worker")
-    assert calls["worker_init"] == ("https://console.example.com", session_token)
+    assert calls["worker_init"] == ("https://console.example.com", session_token, 3 * 60 * 60)
     assert calls["worker_ran"] is True
     assert calls["stop_event_set"] is True and calls["model_stopped"] is True
 
@@ -121,7 +121,7 @@ def test_runtime_push_uses_fixed_private_bundle_and_isolates_token(monkeypatch):
         "enable_gpu": True,
         "enable_tpu": False,
         "enable_internet": True,
-        "dataset_sources": [KAGGLE_RUNTIME_DATASET],
+        "dataset_sources": list(KAGGLE_RUNTIME_DATASETS),
         "competition_sources": [],
         "kernel_sources": [],
         "model_sources": [],
@@ -183,16 +183,39 @@ def test_runtime_configuration_validation():
         KaggleRuntimeClient("token", "job579/runtime-test", accelerator="T4; whoami")
 
 
+def test_runtime_dataset_bundle_is_fixed_ordered_and_not_caller_selectable():
+    assert KAGGLE_RUNTIME_DATASETS == (
+        "job579/qwen3-8-27b-unsloth-q4-runtime",
+        "job579/ornith-1-5-35b-a3b-q4-runtime",
+    )
+    assert len(KAGGLE_RUNTIME_DATASETS) == len(set(KAGGLE_RUNTIME_DATASETS))
+    client = KaggleRuntimeClient("token", "job579/runtime-test")
+    with pytest.raises(TypeError):
+        client.push(
+            "https://console.example.com",
+            "pass",
+            operation_id="e" * 32,
+            bootstrap_token="sk-strata-bootstrap-" + "f" * 48,
+            dataset_sources=["attacker/untrusted-dataset"],
+        )
+
+
 def test_runtime_no_run_uses_disabled_placeholder_not_real_credentials():
     calls = []
 
     def runner(command, **kwargs):
         folder = Path(command[command.index("-p") + 1])
-        calls.append(json.loads((folder / "runtime.ipynb").read_text(encoding="utf-8")))
+        calls.append({
+            "command": list(command),
+            "notebook": json.loads((folder / "runtime.ipynb").read_text(encoding="utf-8")),
+            "metadata": json.loads((folder / "kernel-metadata.json").read_text(encoding="utf-8")),
+        })
         return subprocess.CompletedProcess(command, 0, stdout="created", stderr="")
 
     client = KaggleRuntimeClient("token", "job579/runtime-test", runner=runner)
     client.push("https://console.example.com", "pass", no_run=True)
-    serialized = json.dumps(calls[0], ensure_ascii=False)
+    serialized = json.dumps(calls[0]["notebook"], ensure_ascii=False)
     assert "sk-strata-bootstrap-template-disabled" in serialized
     assert "STRATA_WORKER_KEY" in serialized and "UserSecretsClient" not in serialized
+    assert calls[0]["metadata"]["dataset_sources"] == list(KAGGLE_RUNTIME_DATASETS)
+    assert calls[0]["command"][-1] == "--no-run"
