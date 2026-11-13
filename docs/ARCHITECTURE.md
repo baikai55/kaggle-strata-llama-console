@@ -37,11 +37,13 @@ Kaggle 只建立出站 HTTPS 连接，不要求开放 Notebook 入站端口或�
 
 每次推理在 SQLite 中写入独立请求记录，包含来源、Key 名称/前缀、模型、状态、创建/领取/首 token/完成时间和模型实际返回的 token 用量。最终 SSE 的 llama.cpp `timings` 只提取 decode token 数与毫秒数；页面分别展示模型 decode TPS 与流式交付 TPS，消息正文和完整 Key 不进入请求监控表。
 
-`llama_preset` 只接受固定白名单 `qwen38_27b`、`ornith_35b_a3b` 与 `ornith_35b_a3b_vision`。Worker 心跳上报当前 `model.preset`，服务端将它与已保存目标预设比较；不一致时 `/v1/models` 返回空列表，聊天返回 503。切换命令排队后立即阻止新聊天，待既有任务结束再严格执行“停止旧进程 → 校验目标 Dataset → 启动新进程”。切换失败保持未就绪，不回退为旧模型 ready。Strata 不参与这条隐式切换路径，跨 backend 必须先显式停止。
+`llama_preset` 只接受固定白名单 `qwen38_27b`、`qwen38_27b_mtp`、`qwen38_27b_mtp_vision`、`ornith_35b_a3b` 与 `ornith_35b_a3b_vision`。Worker 心跳上报当前 `model.preset`，服务端将它与已保存目标预设比较；不一致时 `/v1/models` 返回空列表，聊天返回 503。切换命令排队后立即阻止新聊天，待既有任务结束再严格执行“停止旧进程 → 校验目标 Dataset → 启动新进程”。切换失败保持未就绪，不回退为旧模型 ready。Strata 不参与这条隐式切换路径，跨 backend 必须先显式停止。
+
+两个 Qwen MTP 预设都与稳定 Qwen 复用相同主 GGUF，固定 llama.cpp 在没有 `-md` 时直接针对 target model 创建 MTP context，因此不扩大 Dataset 或开放任意 draft 路径。两者都固定 `n-max=2`；`qwen38_27b_mtp` 不加载 mmproj，`qwen38_27b_mtp_vision` 加载已校验投影。n=4 已完成隔离 smoke，但长输出接受率下降且没有性能收益，因此不保留为运行预设。模型 `/health` 就绪后，Worker 还要求 `/slots` 至少一个 slot 报告 `speculative=true`，避免 speculative 初始化失败后静默按普通解码运行。稳定 Qwen 始终保留为视觉与非投机回退。
 
 ## Kaggle 生命周期
 
-Qwen 模型、`mmproj-F16.gguf`、`llama-server` 和运行信息存于私有 Dataset `job579/qwen3-8-27b-unsloth-q4-runtime`；Ornith 模型、配套 mmproj 和固定来源清单存于 `job579/ornith-1-5-35b-a3b-q4-runtime`。专用 Runtime 按固定顺序同时挂载两套 Dataset，HTTP 调用方不能增删或替换；未加载的 Dataset 只作为只读 Input，不占模型 RAM/显存。Worker 始终从 Qwen Runtime Dataset 取得已验证 `llama-server`，再按 preset 从对应 Dataset 发现模型资产。固定 manifest 校验文件名、大小、来源提交和 SHA-256 声明；Qwen 和 Ornith 视觉预设加载各自配套投影，Ornith 高速文本预设只加载主模型。手动 Worker 默认空闲 8 分钟，托管 Runtime 可保持到 3 小时总时长上限；不发送伪造活动规避配额。
+Qwen 模型、`mmproj-F16.gguf`、`llama-server` 和运行信息存于私有 Dataset `job579/qwen3-8-27b-unsloth-q4-runtime`；Ornith 模型、配套 mmproj 和固定来源清单存于 `job579/ornith-1-5-35b-a3b-q4-runtime`。专用 Runtime 按固定顺序同时挂载两套 Dataset，HTTP 调用方不能增删或替换；未加载的 Dataset 只作为只读 Input，不占模型 RAM/显存。Worker 始终从 Qwen Runtime Dataset 取得已验证 `llama-server`，再按 preset 从对应 Dataset 发现模型资产。固定 manifest 校验文件名、大小、来源提交和 SHA-256 声明；稳定 Qwen、Qwen MTP 视觉实验和 Ornith 视觉预设加载各自配套投影，Qwen MTP 纯文本与 Ornith 高速文本预设只加载主模型。手动 Worker 默认空闲 8 分钟，托管 Runtime 可保持到 3 小时总时长上限；不发送伪造活动规避配额。
 
 配额页只调用 Kaggle v2.2.5 官方公开命令：`kaggle quota --format json` 查询 GPU/TPU，`kaggle benchmarks quota --format json` 查询 Daily/Monthly AI Models。查询有 15 秒超时和 60 秒进程内缓存，可部分成功。Private Datasets / Private Models 存储配额没有官方公开接口，因此不抓登录页私有 XHR，也不生成估算值。
 

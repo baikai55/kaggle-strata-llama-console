@@ -23,7 +23,7 @@
 - `llama.cpp` 推理必须从模型到 Worker、管理站、Cloudflare 和 CPA 全链路实时转发 OpenAI SSE；文本、reasoning、工具调用、usage、结束原因和 `[DONE]` 不得在中间层丢失或整包缓冲。
 - 客户端中途断开流式响应时，只取消当前推理并关闭对应模型连接；不得杀死已加载的 `llama-server`，后续请求应能继续成功。
 - 当前 Qwen3.8 llama.cpp 主线需要识图：私有 Dataset 必须携带与模型匹配且可验证的 mmproj，Worker 心跳明确报告视觉能力；未加载投影时图片请求须返回清晰 409，而不是上游 HTTP 500。
-- 管理面板需支持固定 `qwen38_27b`、`ornith_35b_a3b`（高速文本）与 `ornith_35b_a3b_vision`（配套视觉投影）预设；页面必须区分“当前已加载模型”和“已保存目标预设”。表单未保存或模型不一致时不得继续聊天。
+- 管理面板需支持固定 `qwen38_27b`（稳定视觉）、`qwen38_27b_mtp`（n=2 纯文本 MTP）、`qwen38_27b_mtp_vision`（n=2 视觉 MTP 实验）、`ornith_35b_a3b`（高速文本）与 `ornith_35b_a3b_vision`（配套视觉投影）预设；页面必须区分“当前已加载模型”和“已保存目标预设”。表单未保存或模型不一致时不得继续聊天。
 - 同一 Kaggle Runtime 固定挂载两套 llama.cpp Dataset。切换必须等待已有任务结束、先停止旧模型、再加载新模型；一旦切换任务排队就拒绝新聊天，避免请求落到错误模型。llama.cpp 与 Strata 之间仍要求先显式停止，不允许自动跨后端切换。
 - 首版图片输入只接受 user 消息中的 JPEG/PNG Base64 Data URI，不直接抓取 HTTP、私网或本地文件 URL；限制图片数量、解码字节、边长和总像素，任务终态必须清空 SQLite 中的图片 payload。
 - 管理页需支持选图、压缩、预览、删除和失败后恢复待发内容；文本聊天在没有图片时保持原有兼容行为。
@@ -32,6 +32,8 @@
 ## 当前模型主线
 
 当前稳定默认是私有 Dataset `job579/qwen3-8-27b-unsloth-q4-runtime` 中的 Unsloth `Qwen3.8-27B-UD-Q4_K_M`，GGUF 16,564,259,744 bytes，并配套 `mmproj-F16.gguf` 927,607,488 bytes；使用 `llama.cpp`、双 T4、Q8 KV、显式双卡切分。128K 与 256K 均已在 Notebook 本机 API 实测，管理站默认 128K；0.6.0 已完成公开 API 真实图片识别。
+
+0.8.0 增加 `qwen38_27b_mtp` 固定实验预设。生产主 GGUF 已确认自带 `nextn_predict_layers=1` 和完整 `blk.64.nextn.*` 张量，固定 llama.cpp 可在不传 `-md` 的情况下直接创建 MTP context；n=2 真机已确认接受率非零且从约 13.9 tok/s 提升到约 18.78–22.08 tok/s。0.8.1 另增隔离的 `qwen38_27b_mtp_vision` 与配套 mmproj；n=4 现场验收虽识图正确且进程稳定，但 400-token 长输出只有 18.06 tok/s，因此最终也固定 n=2。
 
 0.7.0 增加快速候选预设 `ornith_35b_a3b`，固定指向私有 Dataset `job579/ornith-1-5-35b-a3b-q4-runtime` 中的 `Ornith-1.5-35B-Q4_K_M.gguf`（21,713,463,040 bytes）及配套 mmproj（902,822,240 bytes）。0.7.1 将 Ornith 默认设为不加载 mmproj 的高速文本模式；0.7.2 增加显式视觉预设，仍只接受同仓库同 commit 的固定投影。Qwen 继续默认视觉。
 
@@ -54,3 +56,4 @@
 13. 视觉版 Dataset、`--mmproj` 启动、`vision=true` 心跳、无投影 409、安全图片校验、前端选图和真实图片回答均有当前证据；完成后图片 payload 不留在任务记录中。
 14. 管理面板能保存模型预设并在同一 Worker 会话内执行 Qwen ↔ Ornith 原子切换；切换期间模型列表为空、聊天明确 503，切换失败不得把旧模型继续标记为 ready，且能安全回切。
 15. 请求监控应区分排队、TTFT 与生成耗时，并以首 token 到完成的区间计算 decode tok/s；旧记录无分段时序时显示未知，不得用端到端总耗时冒充解码速度。
+16. Qwen MTP 必须保留非 MTP 回退预设；真机首测确认 draft 实际生成且接受率非零，并与相同请求的普通解码对照。随机采样不承诺逐 token 完全一致；更大的 draft 上限只有在长输出吞吐实测更快时才能保留，n=4 已因无收益回退 n=2。

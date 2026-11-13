@@ -35,11 +35,14 @@
 - `0.7.0` 增加两个固定 llama.cpp 预设：`qwen38_27b` 与 `ornith_35b_a3b`。管理面板同时显示当前已加载模型和保存的目标预设；不一致时只允许排队原子切换，切换开始后拒绝新聊天，等待已有任务结束后先停旧模型再加载新模型。
 - `0.7.1` 将 Ornith 默认改为纯文本模式：Dataset 仍保留并校验 mmproj，但不自动附加；Qwen 继续默认启用视觉。请求监控新增排队、TTFT、生成耗时和初版输出速度；0.7.2 进一步把该墙钟口径明确为交付速度，并从 llama.cpp 原始 `timings` 单列真实 decode。
 - `0.7.2` 修复慢控制面往返触发“每个 token 单独上传一次”的流式反馈循环；请求监控分别展示 llama.cpp 模型 decode 与端到端交付速度。手动 Worker 空闲退出改为 8 分钟，并增加固定 Ornith 视觉预设。正式视觉进程已实测 400-token 文本 decode 67.11 tok/s，固定左红右蓝 PNG 识别正确。
+- `0.8.0` 增加独立 `qwen38_27b_mtp` 纯文本实验预设：复用主 GGUF 内置 NextN/MTP 张量，以 `draft-mtp`、`n-max=2` 起步，不下载独立 draft sidecar。稳定 Qwen 预设继续负责识图，便于同一 Runtime 内 A/B 与即时回退。
+- `0.8.1` 增加隔离的 `qwen38_27b_mtp_vision` 实验预设，同时加载固定 mmproj 与内嵌 MTP。n=4 真机识图正确且进程稳定，但 400-token 长输出仅 18.06 tok/s、接受率 48.9%，没有优于 n=2，因此最终视觉 MTP 预设也固定为 n=2。
 
 ## 能力边界
 
 - 站点运行、Worker 联机、模型加载和外网调用分别验收；离线时不产生模拟回答。
 - Unsloth `Qwen3.8-27B-UD-Q4_K_M`（16,564,259,744 bytes）已在 Kaggle 双 T4 上完成 128K 与 256K 本机 API 实测，管理站默认使用 128K。256K 仍作为手动高占用选项。
+- Qwen 主 GGUF 已确认包含一层完整 MTP 张量。n=2 真机短样本 decode 约 18.78–22.08 tok/s、draft 接受率约 60.9%–88.0%，相对原约 13.9 tok/s 已确认提速；n=4 长样本因接受率降至 48.9% 反而只有 18.06 tok/s，不能稳定拉到 30。视觉 MTP 已正确识别左红右蓝测试图，并在图片后继续完成纯文本请求。
 - Ornith 预设固定使用 `Ornith-1.5-35B-Q4_K_M.gguf`；高速文本预设不加载投影，独立视觉预设加载同仓库同 commit 的固定 mmproj。纯文本 `llama-server` smoke 实测 200-token decode 为 70.717 tok/s；此前含投影请求显示的 4.648 tok/s 实为控制面流式交付速度，不能据此认定视觉投影拖慢模型 decode。两种模式仍分开，以便按需释放约 0.9GB 投影占用。
 - 当前私有 Dataset 同时包含已固定大小、SHA-256 和来源提交的 `mmproj-F16.gguf`。管理站聊天页可选择 JPEG/PNG，最多 4 张、解码后总计 2 MiB；服务端拒绝远程/本地 URL、MIME/魔数不符、边长超过 8192 像素或总像素超过 32 MiP 的图片。
 - 两个 llama.cpp Dataset 固定同时挂载；未加载的权重只占 Kaggle Input，不进入 RAM/显存。Qwen 与 Ornith 可在同一 Worker 会话内切换，但不会同时加载。llama.cpp 与 Strata 之间不做隐式切换，必须先显式停止当前模型。

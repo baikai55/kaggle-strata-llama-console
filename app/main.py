@@ -36,7 +36,7 @@ from app.kaggle_runtime import KaggleRuntimeClient, KaggleRuntimeError
 
 ROOT = Path(__file__).resolve().parent.parent
 SESSION_COOKIE = "strata_session"
-VERSION = "0.7.2"
+VERSION = "0.8.1"
 WORKER_TTL = 45
 JOB_TIMEOUT = 1800
 MAX_BODY = 4 * 1024 * 1024
@@ -62,6 +62,22 @@ LLAMA_DATASET_PREFIXES = (
 )
 LLAMA_PRESET_DEFAULTS = {
     "qwen38_27b": {
+        "llama_alias": "qwen3.8-27b",
+        "llama_context_length": 131072,
+        "llama_kv_type": "q8_0",
+        "llama_batch_size": 1024,
+        "llama_ubatch_size": 256,
+        "llama_tensor_split": "1,1",
+    },
+    "qwen38_27b_mtp": {
+        "llama_alias": "qwen3.8-27b",
+        "llama_context_length": 131072,
+        "llama_kv_type": "q8_0",
+        "llama_batch_size": 1024,
+        "llama_ubatch_size": 256,
+        "llama_tensor_split": "1,1",
+    },
+    "qwen38_27b_mtp_vision": {
         "llama_alias": "qwen3.8-27b",
         "llama_context_length": 131072,
         "llama_kv_type": "q8_0",
@@ -170,7 +186,7 @@ class Settings(StrictModel):
     llama_model_path: str | None = Field(default=None, max_length=2048)
     llama_server_path: str | None = Field(default=None, max_length=2048)
     llama_mmproj_path: str | None = Field(default=None, max_length=2048)
-    llama_preset: Literal["qwen38_27b", "ornith_35b_a3b", "ornith_35b_a3b_vision"] | None = None
+    llama_preset: Literal["qwen38_27b", "qwen38_27b_mtp", "qwen38_27b_mtp_vision", "ornith_35b_a3b", "ornith_35b_a3b_vision"] | None = None
     llama_alias: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
     llama_context_length: int | None = Field(default=None, ge=1024, le=1048576)
     llama_kv_type: Literal["q8_0", "f16"] | None = None
@@ -692,7 +708,19 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
         backend = config.get("backend", "strata")
         if backend != "llama_cpp":
             return model.get("backend") in (None, backend)
-        return model.get("backend") == "llama_cpp" and worker_model_preset(worker) == config.get("llama_preset", "qwen38_27b")
+        target = config.get("llama_preset", "qwen38_27b")
+        if model.get("backend") != "llama_cpp" or worker_model_preset(worker) != target:
+            return False
+        mtp_requirements = {
+            "qwen38_27b_mtp": (False, 2),
+            "qwen38_27b_mtp_vision": (True, 2),
+        }
+        if target in mtp_requirements:
+            vision, n_max = mtp_requirements[target]
+            return (model.get("vision") is vision
+                    and model.get("speculative") == "draft-mtp"
+                    and model.get("spec_draft_n_max") == n_max)
+        return True
 
     def ready(worker, config=None):
         base = (online(worker) and worker.get("status") in ("online", "idle", "ready")
@@ -1274,6 +1302,8 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                 patch["llama_model_path"] = ""
                 patch["llama_mmproj_path"] = ""
             config.update(patch)
+            if config.get("llama_preset") == "qwen38_27b_mtp" and config.get("llama_mmproj_path"):
+                raise HTTPException(422, "Qwen MTP 纯文本预设不加载视觉投影；请使用 Qwen MTP 视觉或稳定 Qwen 预设")
             effective_batch = config["llama_batch_size"] or (256 if config["llama_context_length"] <= 131072 else 128)
             if config["llama_ubatch_size"] > effective_batch:
                 raise HTTPException(422, "ubatch 不能大于 batch")

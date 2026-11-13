@@ -198,6 +198,22 @@ def test_llama_preset_settings_are_fixed_and_old_values_gain_default(instance):
     assert vision.status_code == 200
     assert vision.json()["settings"]["llama_preset"] == "ornith_35b_a3b_vision"
 
+    mtp = c.put("/api/settings", json={"llama_preset": "qwen38_27b_mtp"},
+                headers={"Origin": "http://testserver"})
+    assert mtp.status_code == 200
+    assert mtp.json()["settings"]["llama_preset"] == "qwen38_27b_mtp"
+    assert mtp.json()["settings"]["llama_alias"] == "qwen3.8-27b"
+    rejected_vision = c.put("/api/settings", json={"llama_mmproj_path": qwen_mmproj},
+                            headers={"Origin": "http://testserver"})
+    assert rejected_vision.status_code == 422 and "MTP" in rejected_vision.text
+
+    mtp_vision = c.put("/api/settings", json={"llama_preset": "qwen38_27b_mtp_vision"},
+                       headers={"Origin": "http://testserver"})
+    assert mtp_vision.status_code == 200
+    assert mtp_vision.json()["settings"]["llama_preset"] == "qwen38_27b_mtp_vision"
+    assert mtp_vision.json()["settings"]["llama_alias"] == "qwen3.8-27b"
+    assert mtp_vision.json()["settings"]["llama_mmproj_path"] == ""
+
     with sqlite3.connect(app.state.db_path) as db:
         legacy = json.loads(db.execute("SELECT value FROM settings WHERE id=1").fetchone()[0])
         legacy.pop("llama_preset", None)
@@ -387,6 +403,65 @@ def test_online_llama_preset_switch_is_atomic_and_blocks_new_chat(instance):
     assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model={
         "name": "ornith-1.5-35b-a3b", "status": "ready", "backend": "llama_cpp",
         "preset": "ornith_35b_a3b_vision", "vision": True,
+    }).status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "ready"
+
+
+def test_qwen_mtp_is_a_distinct_atomic_preset(instance):
+    c, cfg, app = instance
+    setup(c, cfg)
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model={
+        "name": "qwen3.8-27b", "status": "ready", "backend": "llama_cpp",
+        "preset": "qwen38_27b", "vision": True,
+    }).status_code == 200
+    switched = c.put("/api/settings", json={"llama_preset": "qwen38_27b_mtp"},
+                     headers={"Origin": "http://testserver"})
+    assert switched.status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "model_switch_required"
+    assert post_admin(c, "/api/agent/command", {"action": "switch_model"}).status_code == 200
+    job = claim(c, cfg).json()["job"]
+    assert job["payload"]["settings"]["llama_preset"] == "qwen38_27b_mtp"
+    assert finish(c, cfg, job, result={"message": "模型切换完成"}).status_code == 200
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model={
+        "name": "qwen3.8-27b", "status": "ready", "backend": "llama_cpp",
+        "preset": "qwen38_27b_mtp", "vision": False,
+        "speculative": "draft-mtp", "spec_draft_n_max": 2,
+    }).status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "ready"
+
+
+def test_qwen_mtp_vision_n2_is_a_distinct_atomic_preset(instance):
+    c, cfg, app = instance
+    setup(c, cfg)
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model={
+        "name": "qwen3.8-27b", "status": "ready", "backend": "llama_cpp",
+        "preset": "qwen38_27b_mtp", "vision": False,
+        "speculative": "draft-mtp", "spec_draft_n_max": 2,
+    }).status_code == 200
+    switched = c.put("/api/settings", json={"llama_preset": "qwen38_27b_mtp_vision"},
+                     headers={"Origin": "http://testserver"})
+    assert switched.status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "model_switch_required"
+    assert post_admin(c, "/api/agent/command", {"action": "switch_model"}).status_code == 200
+    job = claim(c, cfg).json()["job"]
+    assert job["payload"]["settings"]["llama_preset"] == "qwen38_27b_mtp_vision"
+    assert finish(c, cfg, job, result={"message": "模型切换完成"}).status_code == 200
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model={
+        "name": "qwen3.8-27b", "status": "ready", "backend": "llama_cpp",
+        "preset": "qwen38_27b_mtp_vision", "vision": False,
+        "speculative": "draft-mtp", "spec_draft_n_max": 2,
+    }).status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "model_switch_required"
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model={
+        "name": "qwen3.8-27b", "status": "ready", "backend": "llama_cpp",
+        "preset": "qwen38_27b_mtp_vision", "vision": True,
+        "speculative": "draft-mtp", "spec_draft_n_max": 4,
+    }).status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "model_switch_required"
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model={
+        "name": "qwen3.8-27b", "status": "ready", "backend": "llama_cpp",
+        "preset": "qwen38_27b_mtp_vision", "vision": True,
+        "speculative": "draft-mtp", "spec_draft_n_max": 2,
     }).status_code == 200
     assert c.get("/api/runtime").json()["state"] == "ready"
 

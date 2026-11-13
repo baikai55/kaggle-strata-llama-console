@@ -2,6 +2,26 @@
 
 更新：2026-11-14，Asia/Hong_Kong。
 
+## 本轮 0.8.1：Qwen MTP 视觉与 n=4 现场验收（2026-11-14）
+
+- 新增独立 `qwen38_27b_mtp_vision`，不覆盖已跑通的 n=2 纯文本预设或稳定非 MTP 视觉预设；固定加载主 GGUF 内嵌 MTP 和已校验 `mmproj-F16.gguf`。`0.8.1` 已部署到 Oracle，stamp `20261114T065529`，回滚镜像为 `kaggle-strata-console:before-20261114t065529`；公网与本机 `/healthz` 均正常，数据卷、账号、会话、API Key 和其他容器保持不变。
+- 固定 llama.cpp 与 2026-11-14 上游 master 均在 mixed embedding batch 中存在 `model_dft=null` 的潜在空指针；源码核对确认 Qwen35 标准图片路径会把 vision embedding 交给 MTP。n=4 真机成功加载为 `vision=true`、`draft-mtp`、128K，图片请求和随后纯文本请求均未触发崩溃，因此无需升级或私有重编运行时。
+- n=4 的 107→400 长输出实测 decode **18.06 tok/s**、prefill 89.78 tok/s、TTFT 1.93 秒，draft `538/263`，接受率 **48.9%**；双 T4 静置显存约 11,567 / 12,639 MiB。它低于 n=2 已见的 18.78–22.08 tok/s，证明 draft 上限更大不等于更快，不能把 30 tok/s 作为当前配置的稳定预期。
+- 已知左红右蓝 PNG 首轮因 64-token 上限全部落在 reasoning 中；同一图片上下文追问正确回答“左：红色；右：蓝色”，44-token decode 22.26 tok/s、draft `44/32`。随后清空对话发送纯文本，模型正常返回 `OK`；短请求受固定开销和接受率影响，不作为稳态吞吐基准。
+- 结论是保留视觉 MTP 能力，但将 `qwen38_27b_mtp_vision` 收敛为与纯文本版相同的 `n-max=2`；稳定非 MTP 视觉预设继续作为即时回退。最终本地全量回归为 **103 passed**，Python compileall、`node --check static/app.js` 与 `git diff --check` 均通过。
+- n=2 收敛版最终部署 stamp 为 `20261114T072424`，回滚镜像 `kaggle-strata-console:before-20261114t072424`；容器 healthy、原数据卷与管理员/会话/API Key/设置保留，其他 45 个容器和 `kaggle-adapter.service` 未变化。现场 Runtime 已按用户要求停止，管理页显示 `算力已停止 · complete`，下次启动会使用 n=2 视觉 MTP 配置。
+
+## 本轮 0.8.0：Qwen3.8 内嵌 MTP 实验预设（2026-11-14）
+
+- 新增独立 `qwen38_27b_mtp` 固定预设，与稳定 `qwen38_27b` 复用同一 16,564,259,744-byte 主 GGUF。生产 GGUF 已实解析为 `qwen35.block_count=65`、`nextn_predict_layers=1`，并含 15 个 `blk.64.nextn.*` / MTP tensor；无需下载 1.369GB sidecar。
+- 固定 llama.cpp commit `93cf736a8d1d46aa922e27eb64aa712bcd5ebc30` 已从源码确认支持 `--spec-type draft-mtp`。未传 `-md` 时会直接针对 target model 创建 MTP context；首轮保守固定 `--spec-draft-n-max 2`，后续只在真机 A/B 证明有益时测试 3/4。
+- n=2 MTP 预设保持纯文本，Worker 不自动加载 mmproj，并拒绝为它显式覆盖投影；原稳定 Qwen 预设继续保留已验收识图能力。视觉与 n=4 的组合只进入 0.8.1 独立实验预设。
+- 管理面板保留稳定 Qwen、Qwen MTP、Ornith 高速文本和 Ornith 视觉四个固定预设；切换仍走同一 Worker 内的原子模型重启。当前在线 0.7.2 Worker 不认识新预设，因此本次升级需要一次完整 Runtime 重启，此后预设间切换不再要求重启 Kaggle Runtime。
+- Worker 在 `/health` 就绪后还会读取默认开放的 `/slots`，要求 MTP 预设至少有一个 slot 明确报告 `speculative=true`；若 llama.cpp 静默回退，加载任务直接失败而不伪装成 MTP ready。
+- `0.8.0` 已部署到 Oracle，stamp `20261114T063259`，并经一次完整 Runtime 重启加载新版 Worker；此后同 Worker 内切换预设只重启 `llama-server`。真机心跳为 `qwen38_27b_mtp`、`vision=false`、`draft-mtp`、n=2、128K，`/slots` 已确认 speculative；模型加载约 47.3 秒，双 T4 显存约 10.3 / 12.5 GiB。
+- 两条用户现场请求分别为 499→71 tokens 与 7473→70 tokens：llama decode 约 18.78 / 22.08 tok/s，draft 为 64/39 与 50/44（接受率约 60.9% / 88.0%），第二条 prefill 约 416.96 tok/s；相较原约 13.9 tok/s 已确认提速。输出只有 70/71 token，尚不能代替 256–400 token 稳态 A/B。普通逐 token 的约 31 tok/s 估算不是 MTP 后的绝对天花板。
+- 本地全量回归为 **102 passed**，Python compileall、`node --check static/app.js` 与 `git diff --check` 通过。当前 n=2 服务保持在线供用户继续试用。
+
 ## 本轮 0.7.2：修复 Agent 流式交付限速（2026-11-14）
 
 - `0.7.1` 无投影 Ornith 的正式 400-token 长输出中，llama.cpp 原始 `timings` 为约 67 tok/s，公开链路交付约 41.7 tok/s；但用户真实 Agent 请求仍只有 4.29–4.84 tok/s。逐请求核对最终 SSE 后确认模型本身分别为 55.32、60.84、67.34 tok/s，低速发生在 Worker 上传原始 chunk 的控制面。

@@ -31,9 +31,12 @@ BACKENDS = ("llama_cpp", "strata")
 KV_TYPES = {"int8", "q4_0", "k8v4", "fp16"}
 LLAMA_KV_TYPES = {"q8_0", "f16"}
 DEFAULT_LLAMA_PRESET = "qwen38_27b"
+QWEN_MTP_PRESET = "qwen38_27b_mtp"
+QWEN_MTP_VISION_PRESET = "qwen38_27b_mtp_vision"
 ORNITH_TEXT_PRESET = "ornith_35b_a3b"
 ORNITH_VISION_PRESET = "ornith_35b_a3b_vision"
-LLAMA_PRESETS = frozenset({DEFAULT_LLAMA_PRESET, ORNITH_TEXT_PRESET, ORNITH_VISION_PRESET})
+LLAMA_PRESETS = frozenset({DEFAULT_LLAMA_PRESET, QWEN_MTP_PRESET, QWEN_MTP_VISION_PRESET,
+                           ORNITH_TEXT_PRESET, ORNITH_VISION_PRESET})
 LLAMA_DATASET_ROOTS = (
     Path("/kaggle/input/datasets/job579/qwen3-8-27b-unsloth-q4-runtime"),
     Path("/kaggle/input/qwen3-8-27b-unsloth-q4-runtime"),
@@ -213,7 +216,8 @@ def llama_preset_spec(settings: dict) -> tuple[str, dict]:
     preset = settings.get("llama_preset") or DEFAULT_LLAMA_PRESET
     if preset not in LLAMA_PRESETS:
         raise WorkerError("不支持的 llama.cpp 模型预设")
-    if preset == DEFAULT_LLAMA_PRESET:
+    if preset in (DEFAULT_LLAMA_PRESET, QWEN_MTP_PRESET, QWEN_MTP_VISION_PRESET):
+        is_mtp = preset in (QWEN_MTP_PRESET, QWEN_MTP_VISION_PRESET)
         return preset, {
             "dataset_roots": LLAMA_DATASET_ROOTS,
             "dataset_slug": "job579/qwen3-8-27b-unsloth-q4-runtime",
@@ -227,9 +231,17 @@ def llama_preset_spec(settings: dict) -> tuple[str, dict]:
             "mmproj_bytes": LLAMA_MMPROJ_BYTES,
             "mmproj_sha256": LLAMA_MMPROJ_SHA256,
             "mmproj_source_commit": LLAMA_MMPROJ_SOURCE_COMMIT,
-            "default_vision": True,
+            # Keep both accelerated presets at n=2. The n=4 vision smoke was
+            # stable, but its 400-token decode was slower because acceptance
+            # fell below 50%; vision is therefore an orthogonal preset choice.
+            "default_vision": preset in (DEFAULT_LLAMA_PRESET, QWEN_MTP_VISION_PRESET),
             "alias": "qwen3.8-27b",
             "context": 131072,
+            # The main GGUF already contains blk.64.nextn.* tensors. The
+            # pinned llama.cpp can create an MTP context from the target model,
+            # so this preset deliberately does not require an -md sidecar.
+            "spec_type": "draft-mtp" if is_mtp else None,
+            "spec_draft_n_max": 2 if is_mtp else None,
         }
     return preset, {
         "dataset_roots": ORNITH_DATASET_ROOTS,
@@ -251,6 +263,8 @@ def llama_preset_spec(settings: dict) -> tuple[str, dict]:
         "default_vision": preset == ORNITH_VISION_PRESET,
         "alias": "ornith-1.5-35b-a3b",
         "context": 131072,
+        "spec_type": None,
+        "spec_draft_n_max": None,
     }
 
 
@@ -608,6 +622,8 @@ def prepare_llama(settings: dict, work_dir: Path, model_key: str,
     if not magic(model, b"GGUF"):
         raise WorkerError("模型文件头不是 GGUF；请检查 Dataset 是否完整")
     mmproj_value = settings.get("llama_mmproj_path")
+    if preset == QWEN_MTP_PRESET and mmproj_value:
+        raise WorkerError("Qwen MTP 纯文本预设不加载视觉投影；请切换到 Qwen MTP 视觉或稳定 Qwen 预设")
     mmproj = (locate(mmproj_value, "mmproj", "视觉投影 GGUF", model_roots, required=False)
               if mmproj_value or spec["default_vision"] else None)
     if mmproj is not None:
@@ -722,10 +738,17 @@ def prepare_llama(settings: dict, work_dir: Path, model_key: str,
            "--ubatch-size", str(ubatch), "--flash-attn", "on", "--cache-type-k", kv,
            "--cache-type-v", kv, "--threads", "4", "--threads-batch", "4", "--jinja",
            "--host", "127.0.0.1", "--port", str(port), "--metrics"]
+    if spec["spec_type"]:
+        cmd.extend(["--spec-type", spec["spec_type"],
+                    "--spec-draft-n-max", str(spec["spec_draft_n_max"])])
     if mmproj is not None:
         cmd.extend(["--mmproj", str(mmproj)])
-    return cmd, work_dir, env, {"alias": alias, "context": context, "vision": mmproj is not None,
-                                "preset": preset}
+    info = {"alias": alias, "context": context, "vision": mmproj is not None,
+            "preset": preset}
+    if spec["spec_type"]:
+        info.update({"speculative": spec["spec_type"],
+                     "spec_draft_n_max": spec["spec_draft_n_max"]})
+    return cmd, work_dir, env, info
 
 
 def prepare_config(settings: dict, work_dir: Path, model_key: str,
@@ -1093,6 +1116,14 @@ class Worker:
         except (requests.RequestException, ValueError, KeyError, TypeError):
             return None
 
+    def speculative_loaded(self, session):
+        try:
+            slots = session.get(self.model_url("/slots"), timeout=(1, 3)).json()
+            return isinstance(slots, list) and any(
+                isinstance(slot, dict) and slot.get("speculative") is True for slot in slots)
+        except (requests.RequestException, ValueError, TypeError):
+            return False
+
     def refresh_model(self):
         process = self.process
         if process is None:
@@ -1183,6 +1214,9 @@ class Worker:
             cmd, cwd, env, launch = prepare_llama(settings, self.work_dir, self.model_key, port=self.model_port)
             alias, info["context"], info["vision"], info["preset"] = (
                 launch["alias"], launch["context"], launch["vision"], launch["preset"])
+            if launch.get("speculative"):
+                info["speculative"] = launch["speculative"]
+                info["spec_draft_n_max"] = launch["spec_draft_n_max"]
         else:
             cmd, cwd, env = prepare_config(settings, self.work_dir, self.model_key, port=self.model_port)
         self.backend = backend
@@ -1217,6 +1251,8 @@ class Worker:
                         if not name:
                             raise WorkerError(f"{label} 未报告模型标识")
                         if backend == "llama_cpp":
+                            if info.get("speculative") and not self.speculative_loaded(s):
+                                raise WorkerError("llama.cpp 已就绪，但 MTP 投机解码没有实际激活")
                             info["context"] = self.loaded_context(s) or info["context"]
                             self.log(f"llama.cpp 已就绪：{name}，上下文 {info['context']}")
                         else:

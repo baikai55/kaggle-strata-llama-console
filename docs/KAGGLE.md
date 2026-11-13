@@ -2,7 +2,7 @@
 
 核对日期：2026-11-14（Asia/Hong_Kong）。控制台先部署，再接 Worker；模型本机实测与经管理站外网调用分别验收。
 
-## 0. 一键启动专用 Runtime（0.7.2）
+## 0. 一键启动专用 Runtime（0.8.1）
 
 一键启动使用固定私有 Kaggle Code，例如 `job579/kaggle-strata-console-runtime`。它是由服务器通过 Kaggle 官方 `kernels push/status` 管理的 Commit Run，不是远程操作现有交互式 Draft Session。HTTP 请求不能修改 Notebook slug、加速器、Dataset、代码或命令。
 
@@ -20,10 +20,10 @@ KAGGLE_RUNTIME_ACCELERATOR=NvidiaTeslaT4
 
 首次设置只做一次：
 
-1. 在已部署的 `0.7.2` 源码环境中调用 Runtime 创建流程的 `no_run=True` 模式，创建上述专用私有 Notebook，但不消耗 GPU 启动运行。这个模板使用无效占位凭据，不能作为真实 Worker 运行。
+1. 在已部署的 `0.8.1` 源码环境中调用 Runtime 创建流程的 `no_run=True` 模式，创建上述专用私有 Notebook，但不消耗 GPU 启动运行。这个模板使用无效占位凭据，不能作为真实 Worker 运行。
 2. 核对 Code 为 Private、Internet 开启、GPU 为 T4 ×2，并固定挂载 `job579/qwen3-8-27b-unsloth-q4-runtime` 与 `job579/ornith-1-5-35b-a3b-q4-runtime`。一键启动无需在 **Add-ons → Secrets** 授权 `STRATA_WORKER_KEY`。
 3. 如需手动 Notebook 调试或回退，再单独在 **Add-ons → Secrets** 授权长期 `STRATA_WORKER_KEY`；该授权不属于一键启动控制链。
-4. 回到管理站保存 `qwen38_27b`、`ornith_35b_a3b`（高速文本）或 `ornith_35b_a3b_vision`（视觉）预设，再执行一次真实启动验收。Worker 在线后应自动加载所选模型配置，再验证对话、API、切换和停止。
+4. 回到管理站保存 `qwen38_27b`（稳定视觉）、`qwen38_27b_mtp`（MTP n=2 纯文本）、`qwen38_27b_mtp_vision`（MTP n=2 视觉实验）、`ornith_35b_a3b`（高速文本）或 `ornith_35b_a3b_vision`（视觉）预设，再执行一次真实启动验收。Worker 在线后应自动加载所选模型配置，再验证对话、API、切换和停止。
 
 每次启动会创建新的 operation 和约 20 分钟有效的一次性 bootstrap token，并把它仅放入本次 Push 的 Runtime Notebook。Notebook 通过 HTTPS 调用 `POST /worker/bootstrap`，校验 operation 后换取本次运行的临时 Worker session token；bootstrap 首次成功兑换后只保留约 60 秒幂等重试窗，session 有效期约为 3 小时运行上限加 10 分钟停止宽限。新 operation、确定提交失败、官方终止、Worker stopped 或管理站停止收敛时都会清理对应临时认证。
 
@@ -42,6 +42,8 @@ KAGGLE_RUNTIME_ACCELERATOR=NvidiaTeslaT4
 - 视觉投影：`qwen38-model/mmproj-F16.gguf`，精确大小 927,607,488 bytes，SHA-256 `cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e`，来源提交 `1cff334a4a228324d4ee1f76d55d372588f0d556`。
 - Dataset 当前完整包含 6 个文件，同时保存已验证的 `llama-server`、`LLAMA_CPP_COMMIT.txt`、运行清单与一键启动脚本。Worker 的自动发现范围固定在这个 Dataset，不能从任意挂载目录执行同名 ELF；manifest 会同时验证模型和 mmproj。
 - Kaggle 双 T4 已完成本机 API 实测：128K 使用 Q8 KV、batch 256、ubatch 64；256K 使用 Q8 KV、batch 128、ubatch 32。管理站默认 128K、双卡切分 `1,1`。
+- 主 GGUF 元数据为 `nextn_predict_layers=1`，包含完整 `blk.64.nextn.*` MTP 张量。两个 MTP 预设均不增加 sidecar，并固定 `--spec-draft-n-max 2`；视觉实验版额外加载同一已校验 mmproj。最终 SSE 的 `timings.draft_n` / `draft_n_accepted`、真实 decode、prefill、TTFT 与双卡显存共同作为验收依据。
+- n=2 真机两条短样本分别约 18.78 / 22.08 tok/s，draft 接受率约 60.9% / 88.0%。n=4 视觉进程虽正确识图且保持稳定，但 400-token 长输出只有 18.06 tok/s、接受率 48.9%，因此未提升为默认并回退 n=2。稳定 `qwen38_27b` 始终保留为即时回退。
 - 一次真实冷启动观测为端到端约 4 分 22 秒，其中 GPU/Dataset 就绪约 72 秒、模型加载约 44 秒；Kaggle 排队、共享缓存命中和 Input 挂载没有 SLA，不能把该数字写成保证。
 - 原 88.88GB RVN Strata 方案加载约 14 分钟仍未 ready，随机 I/O 极慢，不满足“5 分钟以内、随开随用”，不再作为默认；Strata 仅保留兼容后端。
 
@@ -54,7 +56,7 @@ Ornith 使用同一主模型提供两个固定预设：`ornith_35b_a3b`（高速
 
 专用 Runtime 固定同时挂载 Qwen 与 Ornith Dataset。未加载的模型只占 Kaggle Input，不进入 RAM/显存；Worker 永远从 Qwen Runtime Dataset 使用已验证的 `llama-server`。管理面板保存 preset 后，可以在同一 Worker 会话中执行 Qwen ↔ Ornith 切换：切换排队后拒绝新聊天，等待既有任务结束，先停止旧模型，再加载目标模型。llama.cpp 与 Strata 之间仍须先显式停止，不能直接切换。
 
-使用时在 Notebook 的 **Add Input → Datasets** 同时挂载上述两套 Dataset，运行控制台生成的接入 Notebook。管理页选择 `llama.cpp` 和目标预设后，GGUF、视觉投影与 `llama-server` 路径通常留空；Worker 会按 preset 校验固定 Dataset、模型大小、运行清单和 llama.cpp commit。Qwen 与 Ornith 视觉预设自动加载配套投影；Ornith 高速文本预设不加载。然后按预设默认值使用 128K、Q8_0、双卡 `1,1` 加载。
+使用时在 Notebook 的 **Add Input → Datasets** 同时挂载上述两套 Dataset，运行控制台生成的接入 Notebook。管理页选择 `llama.cpp` 和目标预设后，GGUF、视觉投影与 `llama-server` 路径通常留空；Worker 会按 preset 校验固定 Dataset、模型大小、运行清单和 llama.cpp commit。稳定 Qwen、Qwen MTP 视觉实验与 Ornith 视觉预设自动加载配套投影；Qwen MTP 纯文本与 Ornith 高速文本预设不加载。然后按预设默认值使用 128K、Q8_0、双卡 `1,1` 加载。
 
 ### 视觉输入与验收边界
 

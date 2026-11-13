@@ -118,12 +118,44 @@ def test_prepare_llama_autodiscovers_verified_inputs_and_keeps_key_out_of_argv(t
     assert cmd[cmd.index("--batch-size") + 1] == "256"
     assert cmd[cmd.index("--ubatch-size") + 1] == "64"
     assert cmd[cmd.index("--port") + 1] == "19090"
+    assert "--spec-type" not in cmd
     assert info == {"alias": "qwen3.8-27b", "context": 131072, "vision": True,
                     "preset": "qwen38_27b"}
     assert cwd == runtime and env["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert env["LLAMA_ARG_API_KEY"] == "local-model-secret"
     assert "LLAMA_API_KEY" not in env
     assert "local-model-secret" not in " ".join(cmd)
+
+    mtp_cmd, _, _, mtp_info = prepare_llama(
+        {"llama_preset": "qwen38_27b_mtp", "llama_context_length": 131072,
+         "llama_kv_type": "q8_0", "llama_tensor_split": "1,1",
+         "llama_batch_size": 1024, "llama_ubatch_size": 256},
+        runtime / "mtp-worker", "local-model-secret", [mounted], port=19091)
+    assert mtp_cmd[mtp_cmd.index("--spec-type") + 1] == "draft-mtp"
+    assert mtp_cmd[mtp_cmd.index("--spec-draft-n-max") + 1] == "2"
+    assert "-md" not in mtp_cmd and "--spec-draft-model" not in mtp_cmd
+    assert "--mmproj" not in mtp_cmd
+    assert mtp_info == {"alias": "qwen3.8-27b", "context": 131072,
+                        "vision": False, "preset": "qwen38_27b_mtp",
+                        "speculative": "draft-mtp", "spec_draft_n_max": 2}
+
+    mtp_vision_cmd, _, _, mtp_vision_info = prepare_llama(
+        {"llama_preset": "qwen38_27b_mtp_vision", "llama_context_length": 131072,
+         "llama_kv_type": "q8_0", "llama_tensor_split": "1,1",
+         "llama_batch_size": 1024, "llama_ubatch_size": 256},
+        runtime / "mtp-vision-worker", "local-model-secret", [mounted], port=19092)
+    assert mtp_vision_cmd[mtp_vision_cmd.index("--spec-type") + 1] == "draft-mtp"
+    assert mtp_vision_cmd[mtp_vision_cmd.index("--spec-draft-n-max") + 1] == "2"
+    assert mtp_vision_cmd[mtp_vision_cmd.index("--mmproj") + 1] == str(mmproj)
+    assert "-md" not in mtp_vision_cmd and "--spec-draft-model" not in mtp_vision_cmd
+    assert mtp_vision_info == {"alias": "qwen3.8-27b", "context": 131072,
+                               "vision": True, "preset": "qwen38_27b_mtp_vision",
+                               "speculative": "draft-mtp", "spec_draft_n_max": 2}
+
+    with pytest.raises(WorkerError, match="纯文本预设不加载视觉投影"):
+        prepare_llama(
+            {"llama_preset": "qwen38_27b_mtp", "llama_mmproj_path": str(mmproj)},
+            runtime / "mtp-vision-worker", "local-model-secret", [mounted])
 
 
 def test_prepare_llama_256k_defaults_and_rejects_ambiguous_or_invalid_inputs(tmp_path):
@@ -212,6 +244,27 @@ def test_prepare_llama_rejects_missing_or_ambiguous_verified_mounts(tmp_path, mo
     second.mkdir()
     with pytest.raises(WorkerError, match="挂载根目录"):
         prepare_llama({}, tmp_path / "worker", "key")
+
+
+def test_worker_requires_server_to_report_speculative_slot():
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class Session:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def get(self, *_args, **_kwargs):
+            return Response(self.payload)
+
+    worker = Worker("http://127.0.0.1", "x" * 16)
+    assert worker.speculative_loaded(Session([{"id": 0, "speculative": True}])) is True
+    assert worker.speculative_loaded(Session([{"id": 0, "speculative": False}])) is False
+    assert worker.speculative_loaded(Session({"unexpected": True})) is False
 
 
 def test_prepare_llama_rejects_unknown_fixed_preset(tmp_path):

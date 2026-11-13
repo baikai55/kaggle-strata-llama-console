@@ -8,9 +8,12 @@
   const CHAT_IMAGE_TOTAL_BYTES = 2 * 1024 * 1024;
   const LLAMA_PRESETS = {
     qwen38_27b: { label: 'Qwen3.8-27B', detail: '稳定 / 较慢' },
+    qwen38_27b_mtp: { label: 'Qwen3.8-27B', detail: 'MTP n=2 / 纯文本实验' },
+    qwen38_27b_mtp_vision: { label: 'Qwen3.8-27B', detail: 'MTP n=2 / 视觉实验' },
     ornith_35b_a3b: { label: 'Ornith-1.5-35B-A3B', detail: 'MoE / 高速文本' },
     ornith_35b_a3b_vision: { label: 'Ornith-1.5-35B-A3B', detail: 'MoE / 视觉' }
   };
+  const presetSelect = document.querySelector('select[name="llama_preset"]');
   const mmprojInput = document.querySelector('input[name="llama_mmproj_path"]');
   if (mmprojInput) {
     mmprojInput.placeholder = '留空按预设决定';
@@ -155,7 +158,7 @@
     return '';
   }
   function modelCallable() {
-    if (!modelReady()) return false;
+    if (!modelReady() || modelSwitchRequired()) return false;
     const selectedBackend = state.settings.backend || 'strata';
     const agent = state.status && state.status.agent;
     const model = agent && agent.model && typeof agent.model === 'object' ? agent.model : {};
@@ -185,6 +188,7 @@
     text('#session-target', backend === 'llama_cpp' ? presetLabel(selectedLlamaPreset()) + (unsaved ? ' · 未保存' : '') : 'Strata');
   }
   function runtimeState(runtime) { return String(runtime && runtime.state || (runtime && runtime.configured ? 'stopped' : 'unconfigured')).toLowerCase(); }
+  function modelSwitchRequired() { return runtimeState(state.runtime || state.status && state.status.runtime) === 'model_switch_required'; }
   function runtimeActive(runtime) { return ['queued_local', 'submitting', 'queued', 'pending', 'running', 'waiting_worker', 'unknown', 'loading_model', 'verifying_model', 'stop_requested', 'stopping'].includes(runtimeState(runtime)); }
   function runtimePhase(runtime) {
     const phases = {
@@ -260,6 +264,7 @@
     const backendField = $('#model-form') && $('#model-form').elements.namedItem('backend');
     const selectedBackend = backendField && backendField.value || state.settings.backend || 'strata';
     const modelFormDirty = dirtyForms.has('model-form');
+    const switchRequired = modelSwitchRequired();
     $$('[data-agent-action]').forEach(function (button) {
       const action = button.dataset.agentAction;
       let available = online;
@@ -269,10 +274,10 @@
         if (modelFormDirty) button.textContent = '请先保存模型选择';
         else if (modelReady() && selectedBackend !== 'llama_cpp') button.textContent = '切换 Strata 前请先停止当前模型';
         else if (transitioning) button.textContent = switching ? '正在切换模型…' : '正在加载模型…';
-        else if (switching && currentPreset === selectedPreset) button.textContent = '已加载所选模型';
+        else if (switching && currentPreset === selectedPreset && !switchRequired) button.textContent = '已加载所选模型';
         else button.textContent = switching ? '切换到所选模型' : '加载所选模型';
         available = online && !modelFormDirty && !transitioning &&
-          (!modelReady() || (switching && currentPreset !== selectedPreset));
+          (!modelReady() || (switching && (currentPreset !== selectedPreset || switchRequired)));
       } else if (action === 'load_model' || action === 'switch_model') {
         available = online && !modelFormDirty && !transitioning;
       }
@@ -381,6 +386,20 @@
     const backend = field && field.value || state.settings.backend || 'strata';
     $$('[data-backend-panel]', form).forEach(function (el) { el.hidden = el.dataset.backendPanel !== backend; });
     $$('[data-backend-required]', form).forEach(function (el) { el.required = el.dataset.backendRequired === backend; });
+    syncLlamaPresetForm();
+  }
+  function syncLlamaPresetForm() {
+    if (!presetSelect || !mmprojInput) return;
+    const textOnlyMtp = presetSelect.value === 'qwen38_27b_mtp';
+    const visionMtp = presetSelect.value === 'qwen38_27b_mtp_vision';
+    mmprojInput.disabled = textOnlyMtp;
+    if (textOnlyMtp) mmprojInput.value = '';
+    const hint = mmprojInput.parentElement && mmprojInput.parentElement.querySelector('small');
+    if (hint) hint.textContent = textOnlyMtp
+      ? 'MTP n=2 纯文本预设不加载视觉投影。'
+      : visionMtp
+        ? '实验预设会同时加载内嵌 MTP（n=2）与固定视觉投影；n=4 已实测不增速。'
+        : 'Qwen 与 Ornith 视觉预设自动加载配套投影；高速文本预设不加载。';
   }
   function updateSettings(settings) {
     if (!settings) return;
@@ -477,11 +496,12 @@ for chunk in response:
     const backend = modelInfo.backend || payload.settings && payload.settings.backend;
     const backendLabel = backend === 'llama_cpp' ? 'llama.cpp' : backend === 'strata' ? 'Strata' : '';
     const loadedContext = safeNumber(modelInfo.context);
-    const modelDetail = [online ? label : name ? '上次模型 · 代理已离线' : '', backendLabel, modelInfo.vision === true ? '视觉已启用' : '', loadedContext === null ? '' : formatNumber(loadedContext) + ' tokens'].filter(Boolean).join(' · ');
+    const speculativeLabel = modelInfo.speculative ? 'MTP n=' + (modelInfo.spec_draft_n_max || '—') : '';
+    const modelDetail = [online ? label : name ? '上次模型 · 代理已离线' : '', backendLabel, speculativeLabel, modelInfo.vision === true ? '视觉已启用' : '', loadedContext === null ? '' : formatNumber(loadedContext) + ' tokens'].filter(Boolean).join(' · ');
     text('#metric-model-detail', name ? modelDetail : backendLabel ? '等待 ' + backendLabel + ' 加载' : '连接后显示真实模型');
     const loadedPresetLabel = modelInfo.preset && LLAMA_PRESETS[modelInfo.preset] ? LLAMA_PRESETS[modelInfo.preset].label : '';
-    text('#session-model', name ? name + (loadedPresetLabel && !name.toLowerCase().includes(loadedPresetLabel.toLowerCase()) ? ' · ' + loadedPresetLabel : '') + (backendLabel ? ' · ' + backendLabel : '') + (modelInfo.vision === true ? ' · 视觉' : '') : '尚未加载');
-    text('#chat-model-label', name ? name + (modelInfo.vision === true ? ' · 可识图' : ' · 仅文字') : '模型尚未就绪');
+    text('#session-model', name ? name + (loadedPresetLabel && !name.toLowerCase().includes(loadedPresetLabel.toLowerCase()) ? ' · ' + loadedPresetLabel : '') + (backendLabel ? ' · ' + backendLabel : '') + (speculativeLabel ? ' · ' + speculativeLabel : '') + (modelInfo.vision === true ? ' · 视觉' : '') : '尚未加载');
+    text('#chat-model-label', name ? name + (speculativeLabel ? ' · ' + speculativeLabel : '') + (modelInfo.vision === true ? ' · 可识图' : ' · 仅文字') : '模型尚未就绪');
     text('#session-last-seen', agent && agent.last_seen ? formatDate(agent.last_seen, true) : '—');
     const launchElapsed = runtimeElapsed(runtime);
     text('#metric-runtime', agent ? formatDuration(agent.runtime_seconds) : launchElapsed === null ? '—' : formatDuration(launchElapsed));
@@ -1170,7 +1190,7 @@ for chunk in response:
   });
   $('#model-form').addEventListener('submit', function (event) { event.preventDefault(); saveSettings(event.currentTarget, '#model-save-status'); });
   $('#model-backend').addEventListener('change', syncBackendForm);
-  $('#model-preset').addEventListener('change', function () { renderModelTarget(); updateActionAvailability(); });
+  $('#model-preset').addEventListener('change', function () { syncLlamaPresetForm(); renderModelTarget(); updateActionAvailability(); });
   $('#settings-form').addEventListener('submit', function (event) { event.preventDefault(); saveSettings(event.currentTarget, '#settings-save-status'); });
   ['#model-form', '#settings-form'].forEach(function (selector) {
     $(selector).addEventListener('input', function () { dirtyForms.add(this.id); updateActionAvailability(); });
