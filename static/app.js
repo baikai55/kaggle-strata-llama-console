@@ -3,24 +3,17 @@
 
   const $ = function (selector, scope) { return (scope || document).querySelector(selector); };
   const $$ = function (selector, scope) { return Array.from((scope || document).querySelectorAll(selector)); };
-  const labels = { overview: '算力总览', quotas: 'Kaggle 配额', models: '模型与会话', chat: '对话测试', keys: 'API 访问', requests: '请求监控', logs: '运行日志', settings: '连接设置' };
+  const labels = { overview: '算力总览', quotas: 'Kaggle 配额', models: '模型与会话', chat: '对话测试', keys: 'API 访问', requests: '请求监控', launches: '启动统计', logs: '运行日志', settings: '连接设置' };
   const CHAT_IMAGE_LIMIT = 4;
   const CHAT_IMAGE_TOTAL_BYTES = 2 * 1024 * 1024;
-  const LLAMA_PRESETS = {
-    qwen38_27b: { label: 'Qwen3.8-27B', detail: '稳定 / 较慢' },
-    qwen38_27b_mtp: { label: 'Qwen3.8-27B', detail: 'MTP n=2 / 纯文本实验' },
-    qwen38_27b_mtp_vision: { label: 'Qwen3.8-27B', detail: 'MTP n=2 / 视觉实验' },
-    ornith_35b_a3b: { label: 'Ornith-1.5-35B-A3B', detail: 'MoE / 高速文本' },
-    ornith_35b_a3b_vision: { label: 'Ornith-1.5-35B-A3B', detail: 'MoE / 视觉' }
-  };
-  const presetSelect = document.querySelector('select[name="llama_preset"]');
+  const presetSelect = document.querySelector('#model-preset');
   const mmprojInput = document.querySelector('input[name="llama_mmproj_path"]');
   if (mmprojInput) {
     mmprojInput.placeholder = '留空按预设决定';
     const hint = mmprojInput.parentElement && mmprojInput.parentElement.querySelector('small');
     if (hint) hint.textContent = 'Qwen 与 Ornith 视觉预设自动加载配套投影；高速 Ornith 不加载。';
   }
-  const state = { authenticated: false, setup: false, currentView: 'overview', status: null, runtime: null, settings: {}, history: [], chatImages: [], chatImageBusy: false, samples: [], logs: [], requests: { summary: {}, rows: [] }, quotas: null, requestPeriod: '7d', requestsBusy: false, quotasBusy: false, pollBusy: false, chatBusy: false, chatJob: null, commandBusy: false, runtimeBusy: false, pendingAuth: false, connectionFresh: false };
+  const state = { authenticated: false, setup: false, currentView: 'overview', status: null, runtime: null, settings: {}, presets: [], history: [], chatImages: [], chatImageBusy: false, samples: [], logs: [], requests: { summary: {}, rows: [] }, quotas: null, requestPeriod: '7d', requestsBusy: false, launches: { summary: {}, rows: [] }, launchPeriod: '30d', launchesBusy: false, launchesAt: 0, quotasBusy: false, pollBusy: false, chatBusy: false, chatJob: null, commandBusy: false, runtimeBusy: false, pendingAuth: false, connectionFresh: false };
   const dirtyForms = new Set();
 
   function safeNumber(value) {
@@ -137,25 +130,38 @@
     const agent = state.status && state.status.agent;
     return Boolean(modelCallable() && agent && agent.model && typeof agent.model === 'object' && agent.model.vision === true);
   }
-  function presetLabel(value) {
-    const preset = LLAMA_PRESETS[value];
-    return preset ? preset.label + '（' + preset.detail + '）' : value || '未选择';
+  // What the preset dropdown offers comes from the server (`presets` in
+  // /api/status). An option is a preset plus, for the two fast presets, the
+  // KV type: the 136K / 176K entries are F16, the 200K entries are Q8.
+  function presetOption(id) { return state.presets.find(function (item) { return item.id === id; }) || null; }
+  function listedOption(id) {
+    return id && presetSelect ? Array.from(presetSelect.options).find(function (el) { return el.value === id; }) || null : null;
   }
-  function selectedLlamaPreset() {
-    const form = $('#model-form');
-    const field = form && form.elements.namedItem('llama_preset');
-    if (field && field.value) return field.value;
-    return state.settings.llama_preset || 'qwen38_27b';
+  function optionLabel(id) {
+    const option = presetOption(id);
+    if (option) return option.label + '（' + option.detail + '）';
+    const listed = listedOption(id);
+    return listed ? listed.textContent : id || '未选择';
   }
-  function loadedLlamaPreset() {
+  function optionFor(preset, kvType) {
+    // The server's rule: a fast preset running Q8 KV is its 200K option.
+    return kvType === 'q8_0' && listedOption(preset + '_200k') ? preset + '_200k' : preset;
+  }
+  function kvLabel(value) { return { f16: 'F16 KV', q8_0: 'Q8 KV' }[value] || ''; }
+  function selectedOption() {
+    return presetSelect && presetSelect.value || state.settings.llama_preset_option || 'qwen38_27b';
+  }
+  function loadedOption() {
     const agent = state.status && state.status.agent;
     const model = agent && agent.model && typeof agent.model === 'object' ? agent.model : {};
-    const reported = model.preset || model.profile || model.llama_preset;
-    if (LLAMA_PRESETS[reported]) return reported;
-    const name = modelName(agent).toLowerCase();
-    if (name.includes('ornith')) return 'ornith_35b_a3b';
-    if (name.includes('qwen3.8') || name.includes('qwen3-8')) return 'qwen38_27b';
-    return '';
+    let preset = model.preset || model.profile || model.llama_preset;
+    if (!listedOption(preset)) {
+      const name = modelName(agent).toLowerCase();
+      preset = name.includes('ornith') ? 'ornith_35b_a3b' : name.includes('qwen3.8') || name.includes('qwen3-8') ? 'qwen38_27b' : '';
+    }
+    // Only the fast presets report their KV type. A model that does not is
+    // taken to hold the saved type, which is also how the server reads it.
+    return preset ? optionFor(preset, model.kv_type || state.settings.llama_kv_type) : '';
   }
   function modelCallable() {
     if (!modelReady() || modelSwitchRequired()) return false;
@@ -170,7 +176,7 @@
       return !loadedBackend || loadedBackend === selectedBackend;
     }
     return loadedBackend === 'llama_cpp'
-      && loadedLlamaPreset() === (state.settings.llama_preset || 'qwen38_27b');
+      && loadedOption() === (state.settings.llama_preset_option || 'qwen38_27b');
   }
   function modelTransitioning() {
     const agent = state.status && state.status.agent;
@@ -185,7 +191,7 @@
     const backendField = $('#model-form') && $('#model-form').elements.namedItem('backend');
     const backend = backendField && backendField.value || state.settings.backend || 'strata';
     const unsaved = dirtyForms.has('model-form');
-    text('#session-target', backend === 'llama_cpp' ? presetLabel(selectedLlamaPreset()) + (unsaved ? ' · 未保存' : '') : 'Strata');
+    text('#session-target', backend === 'llama_cpp' ? optionLabel(selectedOption()) + (unsaved ? ' · 未保存' : '') : 'Strata');
   }
   function runtimeState(runtime) { return String(runtime && runtime.state || (runtime && runtime.configured ? 'stopped' : 'unconfigured')).toLowerCase(); }
   function modelSwitchRequired() { return runtimeState(state.runtime || state.status && state.status.runtime) === 'model_switch_required'; }
@@ -250,7 +256,7 @@
     $('#runtime-setup-button').hidden = configured;
     const resultMessage = item.last_error || item.message || '';
     inlineStatus('#runtime-result', resultMessage, runtimeState(item) === 'failed' || Boolean(item.last_error));
-    text('#runtime-help', configured ? '启动操作会提交专用私有 Notebook 并使用 GPU 配额。Kaggle 官方没有运行中的硬取消接口，异常时仍需在 Kaggle 页面处理。' : '服务端尚未配置专用 Notebook 自动启动；可继续使用手动 Kaggle 接入流程。');
+    text('#runtime-help', configured ? '启动操作会提交专用私有 Notebook 并使用 GPU 配额。模型就绪后连续空闲 8 分钟（没有推理或模型操作）会自动结束运行并释放 GPU，单次最长 3 小时。Kaggle 官方没有运行中的硬取消接口，异常时仍需在 Kaggle 页面处理。' : '服务端尚未配置专用 Notebook 自动启动；可继续使用手动 Kaggle 接入流程。');
     updateActionAvailability();
   }
   function updateActionAvailability() {
@@ -259,8 +265,8 @@
     const agentStatus = String(agent && agent.status || '').toLowerCase();
     const modelStatus = String(agent && agent.model && typeof agent.model === 'object' && agent.model.status || '').toLowerCase();
     const transitioning = modelTransitioning();
-    const selectedPreset = selectedLlamaPreset();
-    const currentPreset = loadedLlamaPreset();
+    const selectedId = selectedOption();
+    const loadedId = loadedOption();
     const backendField = $('#model-form') && $('#model-form').elements.namedItem('backend');
     const selectedBackend = backendField && backendField.value || state.settings.backend || 'strata';
     const modelFormDirty = dirtyForms.has('model-form');
@@ -274,10 +280,10 @@
         if (modelFormDirty) button.textContent = '请先保存模型选择';
         else if (modelReady() && selectedBackend !== 'llama_cpp') button.textContent = '切换 Strata 前请先停止当前模型';
         else if (transitioning) button.textContent = switching ? '正在切换模型…' : '正在加载模型…';
-        else if (switching && currentPreset === selectedPreset && !switchRequired) button.textContent = '已加载所选模型';
+        else if (switching && loadedId === selectedId && !switchRequired) button.textContent = '已加载所选模型';
         else button.textContent = switching ? '切换到所选模型' : '加载所选模型';
         available = online && !modelFormDirty && !transitioning &&
-          (!modelReady() || (switching && (currentPreset !== selectedPreset || switchRequired)));
+          (!modelReady() || (switching && (loadedId !== selectedId || switchRequired)));
       } else if (action === 'load_model' || action === 'switch_model') {
         available = online && !modelFormDirty && !transitioning;
       }
@@ -368,6 +374,7 @@
     if (view === 'keys') refreshKeys();
     if (view === 'quotas') refreshQuotas();
     if (view === 'requests') refreshRequests();
+    if (view === 'launches') refreshLaunches();
     if (view === 'logs') refreshLogs();
     if (view === 'overview') requestAnimationFrame(drawChart);
   }
@@ -390,16 +397,57 @@
   }
   function syncLlamaPresetForm() {
     if (!presetSelect || !mmprojInput) return;
-    const textOnlyMtp = presetSelect.value === 'qwen38_27b_mtp';
-    const visionMtp = presetSelect.value === 'qwen38_27b_mtp_vision';
-    mmprojInput.disabled = textOnlyMtp;
-    if (textOnlyMtp) mmprojInput.value = '';
+    const form = $('#model-form');
+    const option = presetOption(presetSelect.value);
+    const preset = option ? option.preset : presetSelect.value.replace(/_200k$/, '');
+    const textOnlyMtp = preset === 'qwen38_27b_mtp';
+    const visionMtp = preset === 'qwen38_27b_mtp_vision';
+    const fastText = preset === 'qwen38_27b_fast';
+    const fastVision = preset === 'qwen38_27b_fast_vision';
+    mmprojInput.disabled = textOnlyMtp || fastText;
+    if (textOnlyMtp || fastText) mmprojInput.value = '';
     const hint = mmprojInput.parentElement && mmprojInput.parentElement.querySelector('small');
-    if (hint) hint.textContent = textOnlyMtp
+    if (hint) hint.textContent = fastText
+      ? '高速纯文本预设不加载视觉投影。'
+      : fastVision
+        ? '高速视觉预设自动加载固定投影。'
+      : textOnlyMtp
       ? 'MTP n=2 纯文本预设不加载视觉投影。'
       : visionMtp
         ? '实验预设会同时加载内嵌 MTP（n=2）与固定视觉投影；n=4 已实测不增速。'
         : 'Qwen 与 Ornith 视觉预设自动加载配套投影；高速文本预设不加载。';
+    text('#model-preset-note', option ? option.note : '');
+    // The 136K / 176K and 200K entries differ in the KV type, so for the fast
+    // presets it follows the entry instead of being a second choice.
+    const pinned = Boolean(option && option.kv_pinned);
+    const kvField = form.elements.namedItem('llama_kv_type');
+    if (pinned) kvField.value = option.fill.llama_kv_type;
+    kvField.disabled = pinned;
+    $('#model-kv-note').hidden = !pinned;
+    const limit = option && safeNumber(option.max_context);
+    form.elements.namedItem('llama_context_length').max = limit || 1048576;
+    text('#model-context-note', limit ? '该选项在双 T4 上实测最多 ' + formatNumber(limit) + ' tokens。' : '128K 为默认目标；更长窗口会增加显存占用。');
+  }
+  function applyPresetOption() {
+    // Choosing an entry fills in the parameters it was measured with.
+    const form = $('#model-form');
+    const option = presetOption(presetSelect.value);
+    if (option) {
+      Object.keys(option.fill).forEach(function (key) {
+        const field = form.elements.namedItem(key);
+        if (field) field.value = String(option.fill[key]);
+      });
+      // A pinned model or projector path belongs to the saved preset: the
+      // server clears both when the preset changes, so the form shows that.
+      ['llama_model_path', 'llama_mmproj_path'].forEach(function (key) {
+        const field = form.elements.namedItem(key);
+        if (option.preset !== state.settings.llama_preset) field.value = '';
+        else if (!field.value) field.value = state.settings[key] || '';
+      });
+    }
+    syncLlamaPresetForm();
+    renderModelTarget();
+    updateActionAvailability();
   }
   function updateSettings(settings) {
     if (!settings) return;
@@ -410,7 +458,7 @@
     const backend = state.settings.backend || 'strata';
     const context = safeNumber(backend === 'llama_cpp' ? state.settings.llama_context_length : state.settings.context_length);
     text('#metric-context', context === null ? '—' : formatNumber(context));
-    text('#metric-context-detail', (backend === 'llama_cpp' ? 'llama.cpp · ' + presetLabel(state.settings.llama_preset || 'qwen38_27b') : 'Strata') + ' 已保存配置');
+    text('#metric-context-detail', (backend === 'llama_cpp' ? 'llama.cpp · ' + optionLabel(state.settings.llama_preset_option || 'qwen38_27b') : 'Strata') + ' 已保存配置');
     const publicUrl = String(state.settings.public_url || '').replace(/\/+$/, '');
     const suppliedEndpoint = state.status && state.status.api_endpoint;
     const endpoint = suppliedEndpoint || (publicUrl ? publicUrl + '/v1' : '');
@@ -447,6 +495,7 @@ for chunk in response:
       const payload = await api('/api/status');
       if (!state.authenticated) return;
       state.status = payload;
+      if (Array.isArray(payload.presets)) state.presets = payload.presets;
       state.runtime = payload.runtime || null;
       state.connectionFresh = true;
       updateSettings(payload.settings || {});
@@ -496,13 +545,24 @@ for chunk in response:
     const backend = modelInfo.backend || payload.settings && payload.settings.backend;
     const backendLabel = backend === 'llama_cpp' ? 'llama.cpp' : backend === 'strata' ? 'Strata' : '';
     const loadedContext = safeNumber(modelInfo.context);
-    const speculativeLabel = modelInfo.speculative ? 'MTP n=' + (modelInfo.spec_draft_n_max || '—') : '';
-    const modelDetail = [online ? label : name ? '上次模型 · 代理已离线' : '', backendLabel, speculativeLabel, modelInfo.vision === true ? '视觉已启用' : '', loadedContext === null ? '' : formatNumber(loadedContext) + ' tokens'].filter(Boolean).join(' · ');
+    const loadedKv = kvLabel(modelInfo.kv_type);
+    const speculativeLabel = modelInfo.speculative
+      ? (modelInfo.split_mode === 'tensor' ? 'tensor 切分 · ' : '') + 'MTP n=' + (modelInfo.spec_draft_n_max || '—')
+        + (String(modelInfo.speculative).includes('ngram-mod') ? ' + ngram' : '')
+      : '';
+    const modelDetail = [online ? label : name ? '上次模型 · 代理已离线' : '', backendLabel, speculativeLabel, modelInfo.vision === true ? '视觉已启用' : '', loadedKv, loadedContext === null ? '' : formatNumber(loadedContext) + ' tokens'].filter(Boolean).join(' · ');
     text('#metric-model-detail', name ? modelDetail : backendLabel ? '等待 ' + backendLabel + ' 加载' : '连接后显示真实模型');
-    const loadedPresetLabel = modelInfo.preset && LLAMA_PRESETS[modelInfo.preset] ? LLAMA_PRESETS[modelInfo.preset].label : '';
-    text('#session-model', name ? name + (loadedPresetLabel && !name.toLowerCase().includes(loadedPresetLabel.toLowerCase()) ? ' · ' + loadedPresetLabel : '') + (backendLabel ? ' · ' + backendLabel : '') + (speculativeLabel ? ' · ' + speculativeLabel : '') + (modelInfo.vision === true ? ' · 视觉' : '') : '尚未加载');
+    const loadedPreset = presetOption(modelInfo.preset);
+    const loadedPresetLabel = loadedPreset ? loadedPreset.label : '';
+    text('#session-model', name ? name + (loadedPresetLabel && !name.toLowerCase().includes(loadedPresetLabel.toLowerCase()) ? ' · ' + loadedPresetLabel : '') + (backendLabel ? ' · ' + backendLabel : '') + (speculativeLabel ? ' · ' + speculativeLabel : '') + (modelInfo.vision === true ? ' · 视觉' : '') + (loadedKv ? ' · ' + loadedKv : '') : '尚未加载');
     text('#chat-model-label', name ? name + (speculativeLabel ? ' · ' + speculativeLabel : '') + (modelInfo.vision === true ? ' · 可识图' : ' · 仅文字') : '模型尚未就绪');
     text('#session-last-seen', agent && agent.last_seen ? formatDate(agent.last_seen, true) : '—');
+    // The window is fixed when llama-server starts. Saving another length for
+    // the same entry does not reload the model, so say what is really loaded.
+    const savedContext = safeNumber(state.settings.llama_context_length);
+    const contextPending = modelCallable() && modelInfo.backend === 'llama_cpp' && loadedContext !== null && savedContext !== null && loadedContext !== savedContext;
+    $('#session-hint').hidden = !contextPending;
+    text('#session-hint', contextPending ? '已保存的上下文是 ' + formatNumber(savedContext) + '，当前加载的仍是 ' + formatNumber(loadedContext) + '。要让新窗口生效，先“停止推理进程”，再“加载所选模型”。' : '');
     const launchElapsed = runtimeElapsed(runtime);
     text('#metric-runtime', agent ? formatDuration(agent.runtime_seconds) : launchElapsed === null ? '—' : formatDuration(launchElapsed));
     text('#metric-runtime-detail', online ? '当前 Kaggle 代理会话' : launching ? runtimeInfo[0] : agent ? '上次会话 · 已离线' : 'Kaggle 会话尚未连接');
@@ -585,12 +645,15 @@ for chunk in response:
     if (!ctx) return;
     ctx.scale(scale, scale);
     const top = 8, bottom = height - 9;
-    ctx.strokeStyle = '#243246'; ctx.lineWidth = 1;
+    // The chart takes its colours from the stylesheet, like everything else.
+    const palette = getComputedStyle(document.documentElement);
+    const colour = function (name, fallback) { return palette.getPropertyValue(name).trim() || fallback; };
+    ctx.strokeStyle = colour('--chart-grid', '#e4e9ef'); ctx.lineWidth = 1;
     for (let i = 0; i < 4; i++) { const y = top + (bottom - top) / 3 * i; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke(); }
     const samples = state.samples;
     if (samples.length < 2) return;
     ['gpu', 'ram'].forEach(function (key) {
-      ctx.strokeStyle = key === 'gpu' ? '#5ee1bc' : '#72a9f7'; ctx.lineWidth = 1.8;
+      ctx.strokeStyle = key === 'gpu' ? colour('--chart-gpu', '#12a583') : colour('--chart-ram', '#3d7fe0'); ctx.lineWidth = 1.8;
       ctx.beginPath(); let started = false;
       samples.forEach(function (sample, i) {
         const value = sample[key];
@@ -810,6 +873,111 @@ for chunk in response:
     } catch (error) { $('#requests-error').textContent = error.message; }
     finally { state.requestsBusy = false; button.disabled = false; button.classList.remove('refreshing'); }
   }
+  // Launch history: one row per click on "启动算力" (or per API wake-up).
+  const LAUNCH_PHASES = { submitting: ['正在提交', 'warn'], queued: ['Kaggle 排队中', 'warn'], loading: ['正在加载模型', 'warn'], ready: ['运行中', 'good'] };
+  const LAUNCH_END_REASONS = {
+    idle: ['空闲自动停止', ''], max_runtime: ['达到最长运行时间', ''], shutdown: ['按停止请求结束', ''], stopped: ['按停止请求结束', ''],
+    cancelled_before_submit: ['提交前已取消', ''], superseded: ['被新的启动取代', ''], worker_stopped: ['Worker 已退出（未报告原因）', ''],
+    kaggle_complete: ['Kaggle 运行已结束', ''], kaggle_cancelled: ['Kaggle 运行被取消', 'bad'], kaggle_error: ['Kaggle 运行出错', 'bad'],
+    submit_failed: ['提交 Kaggle 失败', 'bad'], lost_contact: ['与控制台失联', 'bad'], rejected: ['控制台拒绝了 Worker', 'bad'],
+    interrupted: ['运行被中断', 'bad'], job_expired: ['任务超时后退出', 'bad'], register_failed: ['Worker 注册失败', 'bad'],
+    crashed: ['Worker 异常退出', 'bad'], unknown: ['原因未知', '']
+  };
+  function formatSpan(seconds) {
+    const n = safeNumber(seconds);
+    if (n === null) return '—';
+    const s = Math.max(0, Math.round(n));
+    if (s < 60) return s + ' 秒';
+    if (s < 3600) return Math.floor(s / 60) + ' 分 ' + String(s % 60).padStart(2, '0') + ' 秒';
+    return Math.floor(s / 3600) + ' 小时 ' + String(Math.floor(s % 3600 / 60)).padStart(2, '0') + ' 分';
+  }
+  function launchTarget(item) {
+    const target = item.target || {};
+    if (target.backend && target.backend !== 'llama_cpp') return ['Strata', ''];
+    const option = presetOption(target.option);
+    const context = safeNumber(target.context_length);
+    return [option ? option.label + ' · ' + option.detail : target.option || target.preset || '—',
+      [kvLabel(target.kv_type), context === null ? '' : formatNumber(context) + ' tokens'].filter(Boolean).join(' · ')];
+  }
+  function spanCell(seconds, notes, live) {
+    // `live` marks a phase that is still running: the figure is so far, not final.
+    const cell = node('td', 'launch-span' + (live ? ' live' : ''));
+    cell.append(node('strong', '', formatSpan(seconds) + (live && safeNumber(seconds) !== null ? ' …' : '')));
+    notes.filter(Boolean).forEach(function (note) { cell.append(node('small', '', note)); });
+    return cell;
+  }
+  function renderLaunches() {
+    const payload = state.launches || {};
+    const summary = payload.summary || {};
+    const rows = Array.isArray(payload.rows) ? payload.rows : [];
+    const total = summary.launches || 0;
+    text('#launches-total', formatNumber(total));
+    text('#launches-total-note', total ? [(summary.ready || 0) + ' 次就绪', summary.not_ready ? summary.not_ready + ' 次未就绪' : '', summary.in_progress ? summary.in_progress + ' 次进行中' : ''].filter(Boolean).join(' · ') : '当前时间范围内没有启动');
+    [['queue', '提交 Notebook 到 Worker 上线'], ['load', 'Worker 上线到模型就绪'], ['ready', '点击启动到可以调用']].forEach(function (pair) {
+      const longest = safeNumber(summary[pair[0] + '_max_seconds']);
+      text('#launches-' + pair[0], formatSpan(summary[pair[0] + '_median_seconds']));
+      text('#launches-' + pair[0] + '-note', (longest === null ? '' : '最长 ' + formatSpan(longest) + ' · ') + pair[1]);
+    });
+    text('#launches-session', total ? formatSpan(summary.session_total_seconds) : '—');
+    text('#launches-idle', formatNumber(summary.idle_stops || 0));
+    text('#launches-idle-note', summary.idle_stops ? '其后 30 分钟内又启动 ' + (summary.idle_relaunches || 0) + ' 次' : '连续空闲 8 分钟后结束');
+    text('#launches-count', rows.length + ' 次启动');
+    const body = $('#launches-table-body'); body.replaceChildren();
+    if (!rows.length) {
+      const row = node('tr'), cell = node('td', 'table-empty', '当前时间范围内没有启动记录');
+      cell.colSpan = 8; row.append(cell); body.append(row); return;
+    }
+    rows.forEach(function (item) {
+      const live = item.phase !== 'ended';
+      const row = node('tr');
+      const when = node('td', 'request-time');
+      when.append(node('strong', '', formatDate(item.requested_at, true)), node('small', '', item.requester && item.requester.kind === 'api' ? 'API Key · ' + item.requester.name : '管理站'));
+      if (safeNumber(item.after_idle_seconds) !== null) when.append(node('small', '', '空闲停止后 ' + formatSpan(item.after_idle_seconds) + '又启动'));
+      const target = launchTarget(item), config = node('td', 'request-origin');
+      config.append(node('strong', '', target[0]));
+      if (target[1]) config.append(node('small', '', target[1]));
+      const loaded = item.model;
+      if (loaded && loaded.name) config.append(node('small', '', '已加载 ' + [loaded.name, kvLabel(loaded.kv_type), safeNumber(loaded.context) === null ? '' : formatNumber(loaded.context) + ' tokens', loaded.vision === true ? '视觉' : ''].filter(Boolean).join(' · ')));
+      let phase = live ? LAUNCH_PHASES[item.phase] || [item.phase, 'neutral'] : item.ready_at === null ? ['未就绪', 'bad'] : ['已结束', 'neutral'];
+      if (live && item.stop_requested_at !== null) phase = ['正在停止', 'warn'];
+      const status = node('td', 'request-time'), badge = node('span', 'badge ' + phase[1]);
+      badge.append(node('span', 'status-dot'), document.createTextNode(phase[0])); status.append(badge);
+      if (live) status.append(node('small', '', '本阶段已 ' + formatSpan(item.phase_seconds)));
+      const queued = live && item.phase === 'queued';
+      const split = item.running_at !== null && item.submitted_at !== null && item.worker_at !== null && item.running_at >= item.submitted_at && item.running_at <= item.worker_at;
+      const queue = spanCell(queued ? item.phase_seconds : item.queue_seconds, [
+        split ? 'Kaggle 分配约 ' + formatSpan(item.running_at - item.submitted_at) : '',
+        split ? '启动 Worker 约 ' + formatSpan(item.worker_at - item.running_at) : '',
+        safeNumber(item.submit_seconds) === null ? '' : '提交 Notebook ' + formatSpan(item.submit_seconds)
+      ], queued);
+      const loading = live && item.phase === 'loading';
+      const load = spanCell(loading ? item.phase_seconds : item.load_seconds, [], loading);
+      const waiting = live && item.ready_at === null;
+      const ready = spanCell(waiting ? item.total_seconds : item.ready_seconds, [waiting ? '尚未就绪' : item.ready_at === null ? '结束前没有就绪' : formatDate(item.ready_at, true) + ' 就绪'], waiting);
+      const session = spanCell(item.session_seconds, [safeNumber(item.total_seconds) === null ? '' : (live ? '点击至今 ' : '点击到结束 ') + formatSpan(item.total_seconds)], live && item.worker_at !== null);
+      const end = node('td', 'request-detail');
+      if (live) end.append(node('strong', 'launch-reason', '—'));
+      else {
+        const reason = LAUNCH_END_REASONS[item.end_reason] || [item.end_reason || '未记录', ''];
+        end.append(node('strong', 'launch-reason ' + reason[1], reason[0]), node('small', '', formatDate(item.ended_at, true) + ' 结束'));
+      }
+      if (item.error) end.append(node('small', 'request-error', item.error));
+      row.append(when, config, status, queue, load, ready, session, end); body.append(row);
+    });
+  }
+  async function refreshLaunches() {
+    if (!state.authenticated || state.launchesBusy) return;
+    state.launchesBusy = true;
+    const button = $('#launches-refresh-button'); button.disabled = true;
+    $('#launches-error').textContent = '';
+    try {
+      state.launches = await api('/api/runtime/runs?' + new URLSearchParams({ period: state.launchPeriod, limit: '100' }).toString());
+      state.launchesAt = Date.now();
+      renderLaunches();
+      text('#launches-updated-at', '更新于 ' + new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }));
+    } catch (error) { $('#launches-error').textContent = error.message; }
+    finally { state.launchesBusy = false; button.disabled = false; }
+  }
   function quotaAmount(value, unit) {
     const number = safeNumber(value);
     if (number === null) return value === null || value === undefined || value === '' ? '—' : String(value);
@@ -893,10 +1061,12 @@ for chunk in response:
     catch (error) { $('#quotas-error').textContent = error.message; }
     finally { state.quotasBusy = false; button.disabled = false; button.classList.remove('refreshing'); }
   }
-  function confirmAction(title, description, label) {
+  function confirmAction(title, description, label, constructive) {
+    // `constructive` marks actions that start something; everything else stops or revokes.
     return new Promise(function (resolve) {
       const dialog = $('#confirm-dialog');
       text('#confirm-title', title); text('#confirm-description', description); text('#confirm-proceed', label || '确认');
+      $('#confirm-proceed').className = 'button ' + (constructive ? 'primary' : 'danger');
       dialog.returnValue = 'cancel';
       const onClose = function () { dialog.removeEventListener('close', onClose); resolve(dialog.returnValue === 'confirm'); };
       dialog.addEventListener('close', onClose); dialog.showModal();
@@ -926,7 +1096,8 @@ for chunk in response:
     const confirmed = await confirmAction(
       starting ? '启动 Kaggle 算力' : '停止 Kaggle 算力',
       starting ? '这会通过 Kaggle 官方接口提交专用私有 Notebook，并开始消耗 GPU 配额。Worker 上线后将自动加载模型。' : '这会请求 Worker 停止模型并退出，专用 Notebook 随后自然结束。Kaggle 官方没有运行中的硬取消接口，异常时仍需到 Kaggle 页面处理。',
-      starting ? '启动算力' : '停止算力'
+      starting ? '启动算力' : '停止算力',
+      starting
     );
     if (!confirmed) return;
     state.runtimeBusy = true; updateActionAvailability();
@@ -954,7 +1125,7 @@ for chunk in response:
     };
     if (state.commandBusy || !isAgentOnline()) return;
     const info = descriptions[action];
-    if (!info || !(await confirmAction(info[0], info[1], info[2]))) return;
+    if (!info || !(await confirmAction(info[0], info[1], info[2], action === 'load_model' || action === 'switch_model'))) return;
     state.commandBusy = true; updateActionAvailability();
     inlineStatus('#command-result', '正在提交命令…');
     try {
@@ -1168,7 +1339,7 @@ for chunk in response:
   $$('[data-runtime-action]').forEach(function (el) { el.addEventListener('click', function () { runtimeAction(el.dataset.runtimeAction); }); });
   $('#menu-button').addEventListener('click', function () { const open = $('#sidebar').classList.toggle('open'); $('#sidebar-backdrop').hidden = !open; $('#menu-button').setAttribute('aria-expanded', String(open)); });
   $('#sidebar-backdrop').addEventListener('click', closeSidebar);
-  $('#refresh-button').addEventListener('click', function () { refreshStatus(); if (state.currentView === 'quotas') refreshQuotas(); if (state.currentView === 'requests') refreshRequests(); });
+  $('#refresh-button').addEventListener('click', function () { refreshStatus(); if (state.currentView === 'quotas') refreshQuotas(); if (state.currentView === 'requests') refreshRequests(); if (state.currentView === 'launches') refreshLaunches(); });
   $('#auth-retry').addEventListener('click', checkAuth);
   $('#auth-form').addEventListener('submit', async function (event) {
     event.preventDefault(); if (state.pendingAuth) return;
@@ -1185,12 +1356,12 @@ for chunk in response:
     finally { state.pendingAuth = false; $('#auth-submit').disabled = false; }
   });
   $('#logout-button').addEventListener('click', async function () {
-    try { await api('/api/logout', { method: 'POST' }); hideNewKey(); state.history = []; state.chatImages = []; renderChatImages(); state.samples = []; state.status = null; state.runtime = null; state.runtimeBusy = false; state.requests = { summary: {}, rows: [] }; state.quotas = null; showAuth(false); }
+    try { await api('/api/logout', { method: 'POST' }); hideNewKey(); state.history = []; state.chatImages = []; renderChatImages(); state.samples = []; state.status = null; state.runtime = null; state.runtimeBusy = false; state.requests = { summary: {}, rows: [] }; state.launches = { summary: {}, rows: [] }; state.quotas = null; showAuth(false); }
     catch (error) { toast(error.message, 'error'); }
   });
   $('#model-form').addEventListener('submit', function (event) { event.preventDefault(); saveSettings(event.currentTarget, '#model-save-status'); });
   $('#model-backend').addEventListener('change', syncBackendForm);
-  $('#model-preset').addEventListener('change', function () { syncLlamaPresetForm(); renderModelTarget(); updateActionAvailability(); });
+  $('#model-preset').addEventListener('change', applyPresetOption);
   $('#settings-form').addEventListener('submit', function (event) { event.preventDefault(); saveSettings(event.currentTarget, '#settings-save-status'); });
   ['#model-form', '#settings-form'].forEach(function (selector) {
     $(selector).addEventListener('input', function () { dirtyForms.add(this.id); updateActionAvailability(); });
@@ -1201,6 +1372,14 @@ for chunk in response:
   $('#logs-refresh-button').addEventListener('click', refreshLogs);
   $('#log-filter').addEventListener('input', renderLogs);
   $('#requests-refresh-button').addEventListener('click', refreshRequests);
+  $('#launches-refresh-button').addEventListener('click', refreshLaunches);
+  $$('[data-launch-period]').forEach(function (button) {
+    button.addEventListener('click', function () {
+      state.launchPeriod = button.dataset.launchPeriod;
+      $$('[data-launch-period]').forEach(function (item) { item.classList.toggle('active', item === button); });
+      refreshLaunches();
+    });
+  });
   $('#quotas-refresh-button').addEventListener('click', refreshQuotas);
   $('#request-filter-form').addEventListener('submit', function (event) { event.preventDefault(); refreshRequests(); });
   $$('[data-request-period]').forEach(function (button) {
@@ -1223,9 +1402,15 @@ for chunk in response:
   $('#bootstrap-button').addEventListener('click', showBootstrap);
   window.addEventListener('hashchange', function () { if (state.authenticated) changeView(location.hash.slice(1)); });
   window.addEventListener('resize', function () { requestAnimationFrame(drawChart); });
-  document.addEventListener('visibilitychange', function () { if (!document.hidden && state.authenticated) { refreshStatus(); if (state.currentView === 'quotas') refreshQuotas(); if (state.currentView === 'requests') refreshRequests(); } });
+  document.addEventListener('visibilitychange', function () { if (!document.hidden && state.authenticated) { refreshStatus(); if (state.currentView === 'quotas') refreshQuotas(); if (state.currentView === 'requests') refreshRequests(); if (state.currentView === 'launches') refreshLaunches(); } });
   window.setInterval(function () { if (state.authenticated && !document.hidden) refreshStatus(); }, 5000);
   window.setInterval(function () { if (state.authenticated && !document.hidden && state.currentView === 'quotas') refreshQuotas(); }, 60000);
   window.setInterval(function () { if (state.authenticated && !document.hidden && state.currentView === 'requests') refreshRequests(); }, 30000);
+  window.setInterval(function () {
+    // A launch in progress is followed closely; finished history only now and then.
+    if (!state.authenticated || document.hidden || state.currentView !== 'launches') return;
+    const live = (state.launches.rows || []).some(function (item) { return item.phase !== 'ended'; });
+    if (live || Date.now() - state.launchesAt >= 30000) refreshLaunches();
+  }, 5000);
   checkAuth();
 })();

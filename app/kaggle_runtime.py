@@ -59,6 +59,12 @@ def _normalize_status(value: str) -> str:
         "kernel_worker_status_complete": "complete",
         "kernel_worker_status_error": "error",
         "kernel_worker_status_cancelled": "cancelled",
+        # The official enum has no CANCELLED: a cancelled run ends in
+        # CANCEL_ACKNOWLEDGED, and CANCEL_REQUESTED is still winding down.
+        "cancel_acknowledged": "cancelled",
+        "kernel_worker_status_cancel_acknowledged": "cancelled",
+        "cancel_requested": "cancelling",
+        "kernel_worker_status_cancel_requested": "cancelling",
         "completed": "complete",
         "failed": "error",
         "canceled": "cancelled",

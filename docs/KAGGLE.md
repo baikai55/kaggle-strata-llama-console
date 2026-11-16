@@ -2,7 +2,7 @@
 
 核对日期：2026-11-14（Asia/Hong_Kong）。控制台先部署，再接 Worker；模型本机实测与经管理站外网调用分别验收。
 
-## 0. 一键启动专用 Runtime（0.8.1）
+## 0. 一键启动专用 Runtime（0.9.6）
 
 一键启动使用固定私有 Kaggle Code，例如 `job579/kaggle-strata-console-runtime`。它是由服务器通过 Kaggle 官方 `kernels push/status` 管理的 Commit Run，不是远程操作现有交互式 Draft Session。HTTP 请求不能修改 Notebook slug、加速器、Dataset、代码或命令。
 
@@ -20,12 +20,12 @@ KAGGLE_RUNTIME_ACCELERATOR=NvidiaTeslaT4
 
 首次设置只做一次：
 
-1. 在已部署的 `0.8.1` 源码环境中调用 Runtime 创建流程的 `no_run=True` 模式，创建上述专用私有 Notebook，但不消耗 GPU 启动运行。这个模板使用无效占位凭据，不能作为真实 Worker 运行。
+1. 在已部署的 `0.9.6` 源码环境中调用 Runtime 创建流程的 `no_run=True` 模式，创建上述专用私有 Notebook，但不消耗 GPU 启动运行。这个模板使用无效占位凭据，不能作为真实 Worker 运行。
 2. 核对 Code 为 Private、Internet 开启、GPU 为 T4 ×2，并固定挂载 `job579/qwen3-8-27b-unsloth-q4-runtime` 与 `job579/ornith-1-5-35b-a3b-q4-runtime`。一键启动无需在 **Add-ons → Secrets** 授权 `STRATA_WORKER_KEY`。
 3. 如需手动 Notebook 调试或回退，再单独在 **Add-ons → Secrets** 授权长期 `STRATA_WORKER_KEY`；该授权不属于一键启动控制链。
-4. 回到管理站保存 `qwen38_27b`（稳定视觉）、`qwen38_27b_mtp`（MTP n=2 纯文本）、`qwen38_27b_mtp_vision`（MTP n=2 视觉实验）、`ornith_35b_a3b`（高速文本）或 `ornith_35b_a3b_vision`（视觉）预设，再执行一次真实启动验收。Worker 在线后应自动加载所选模型配置，再验证对话、API、切换和停止。
+4. 回到管理站保存 `qwen38_27b`（稳定视觉）、`qwen38_27b_mtp`（MTP n=2 纯文本）、`qwen38_27b_mtp_vision`（MTP n=2 视觉实验）、`qwen38_27b_fast`（高速纯文本 176K）、`qwen38_27b_fast_vision`（高速视觉 136K；0.9.6 起两者各有一个 200K 下拉选项，选中即填入 Q8_0 与 204,800）、`ornith_35b_a3b`（高速文本）或 `ornith_35b_a3b_vision`（视觉）预设，再执行一次真实启动验收。Worker 在线后应自动加载所选模型配置，再验证对话、API、切换和停止。
 
-每次启动会创建新的 operation 和约 20 分钟有效的一次性 bootstrap token，并把它仅放入本次 Push 的 Runtime Notebook。Notebook 通过 HTTPS 调用 `POST /worker/bootstrap`，校验 operation 后换取本次运行的临时 Worker session token；bootstrap 首次成功兑换后只保留约 60 秒幂等重试窗，session 有效期约为 3 小时运行上限加 10 分钟停止宽限。新 operation、确定提交失败、官方终止、Worker stopped 或管理站停止收敛时都会清理对应临时认证。
+每次启动会创建新的 operation 和最长 12 小时有效的一次性 bootstrap token（需覆盖 Kaggle GPU 排队时间；实测排队可达 3 小时以上），并把它仅放入本次 Push 的 Runtime Notebook。Notebook 通过 HTTPS 调用 `POST /worker/bootstrap`，校验 operation 后换取本次运行的临时 Worker session token；bootstrap 首次成功兑换后只保留约 60 秒幂等重试窗，session 有效期约为 3 小时运行上限加 10 分钟停止宽限。新 operation、确定提交失败、官方终止、Worker stopped 或管理站停止收敛时都会清理对应临时认证。
 
 长期 `STRATA_WORKER_KEY` 不进入 Runtime Notebook、Kaggle metadata、HTTP 响应或 SQLite。SQLite 只保存 bootstrap/session 的 SHA-256 与期限；Push 使用的临时 Notebook 和 metadata 文件在支持权限位的平台设为 `0600`，CLI 返回后随临时目录删除。服务重启可继续使用尚未过期的散列完成认证，但不会因此重复 Push。
 
@@ -33,7 +33,7 @@ KAGGLE_RUNTIME_ACCELERATOR=NvidiaTeslaT4
 
 重复点击和并发 Wake 会复用同一次操作。Kaggle 提交超时属于结果不确定，控制器只用官方 status 对账，不自动重复 push。服务重启也不会重推未确认的运行。
 
-停止有两种情况：尚未提交的本地操作可直接取消；Kaggle 已接收后没有官方硬取消接口，管理站会显示停止已请求，等待 Worker 上线后立即执行 `shutdown`，不再自动加载。Worker 退出后 Commit Run 自然结束，最终仍应在 Kaggle 页面和官方配额页确认 GPU 已释放。
+停止有两种情况：尚未提交的本地操作可直接取消；Kaggle 已接收后没有官方硬取消接口，管理站会显示停止已请求，等待 Worker 上线后立即执行 `shutdown`，不再自动加载。Worker 退出后 Commit Run 自然结束，最终仍应在 Kaggle 页面和官方配额页确认 GPU 已释放。不手动停止时，连续空闲 8 分钟也会走同一条退出路径。
 
 ## 当前主线：两套固定 llama.cpp 私有 Dataset
 
@@ -193,7 +193,7 @@ Kaggle 官方公开 API 当前没有 Private Datasets / Private Models 存储配
 
 ## 8. 退出与验证边界
 
-手动 Worker 默认空闲 8 分钟停止、总运行最多 3 小时（包括加载与推理）；管理站启动的托管 Runtime 将空闲上限提升到同一 3 小时硬上限。控制台失联约 45 秒也停止模型。队列中的停止/结束命令会等当前任务结束；交互式 Notebook 需要立即停止时可在 Kaggle 中断运行单元。管理站可提交固定专用 Commit Run，但不能启动或硬停止交互式 Draft Session，也不能硬取消 Kaggle 已接收的 Commit Run。**Worker 退出不等于已经确认 Kaggle 释放 GPU，请在 Kaggle 页面确认运行结束并检查配额。**不会模拟活跃或自动重开会话规避平台限制。
+手动 Worker 与管理站启动的托管 Runtime 都在连续空闲 8 分钟后停止、总运行最多 3 小时（包括加载与推理）。空闲指没有推理或模型操作任务：任务开始和结束时重新计时，心跳和状态查询不算；模型加载完成后 8 分钟内没有请求也会结束，所以排队等到 GPU 后要及时使用。托管 Runtime 的 Worker 退出后 Commit Run 随之结束，退出原因写入管理站运行日志。控制台失联约 45 秒也停止模型。队列中的停止/结束命令会等当前任务结束；交互式 Notebook 需要立即停止时可在 Kaggle 中断运行单元。管理站可提交固定专用 Commit Run，但不能启动或硬停止交互式 Draft Session，也不能硬取消 Kaggle 已接收的 Commit Run。**Worker 退出不等于已经确认 Kaggle 释放 GPU，请在 Kaggle 页面确认运行结束并检查配额。**不会模拟活跃或自动重开会话规避平台限制。
 
 普通聊天和模型列表请求不会启动或唤醒 Kaggle；只有管理站启动按钮或独立 Wake API 会提交专用 Runtime。手动流程曾观测完整冷启动约 4 分 22 秒；0.4.1 的一次真实 Commit Run 则约 8 分 22 秒，其中 Worker 接入前约 7 分 39 秒、接入后模型加载约 43 秒。差异主要来自 Kaggle 排队/GPU/Dataset 准备，这些都是现场观测，不是 Kaggle SLA。
 

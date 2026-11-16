@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import threading
@@ -407,6 +408,228 @@ def test_online_llama_preset_switch_is_atomic_and_blocks_new_chat(instance):
     assert c.get("/api/runtime").json()["state"] == "ready"
 
 
+def test_qwen_fast_presets_enforce_measured_context_limits_per_kv_type(instance):
+    c, cfg, app = instance
+    setup(c, cfg)
+    origin = {"Origin": "http://testserver"}
+    assert c.put("/api/settings", json={"llama_preset": "qwen38_27b_mtp"}, headers=origin).status_code == 200
+
+    fast = c.put("/api/settings", json={"llama_preset": "qwen38_27b_fast"}, headers=origin)
+    assert fast.status_code == 200
+    saved = fast.json()["settings"]
+    assert saved["llama_context_length"] == 180224 and saved["llama_kv_type"] == "f16"
+    assert saved["llama_batch_size"] == 1024 and saved["llama_ubatch_size"] == 256
+    assert c.put("/api/settings", json={"llama_context_length": 184320}, headers=origin).status_code == 200
+    too_long = c.put("/api/settings", json={"llama_context_length": 204800}, headers=origin)
+    assert too_long.status_code == 422 and "184320" in too_long.text and "q8_0 KV 可到 204800" in too_long.text
+    assert c.get("/api/settings").json()["settings"]["llama_context_length"] == 184320
+    # Q8 KV is half the size and reaches 200K; going back to f16 needs a
+    # window that f16 can hold.
+    q8 = c.put("/api/settings", json={"llama_kv_type": "q8_0", "llama_context_length": 204800}, headers=origin)
+    assert q8.status_code == 200
+    assert q8.json()["settings"]["llama_kv_type"] == "q8_0" and q8.json()["settings"]["llama_context_length"] == 204800
+    beyond = c.put("/api/settings", json={"llama_context_length": 205824}, headers=origin)
+    assert beyond.status_code == 422 and "204800" in beyond.text and "可到" not in beyond.text
+    assert c.put("/api/settings", json={"llama_kv_type": "f16"}, headers=origin).status_code == 422
+    assert c.put("/api/settings", json={"llama_kv_type": "f16", "llama_context_length": 184320},
+                 headers=origin).status_code == 200
+    projector = c.put("/api/settings", json={"llama_mmproj_path": "/kaggle/input/datasets/job579/qwen3-8-27b-unsloth-q4-runtime/mmproj-F16.gguf"},
+                      headers=origin)
+    assert projector.status_code == 422 and "高速" in projector.text
+
+    # A context the user raised by hand does not follow them to the vision
+    # preset, whose projector leaves less room.
+    assert c.put("/api/settings", json={"llama_preset": "qwen38_27b_fast_vision"},
+                 headers=origin).status_code == 422
+    assert c.put("/api/settings", json={"llama_context_length": 180224}, headers=origin).status_code == 200
+    vision = c.put("/api/settings", json={"llama_preset": "qwen38_27b_fast_vision"}, headers=origin)
+    assert vision.status_code == 200
+    assert vision.json()["settings"]["llama_context_length"] == 139264
+    assert vision.json()["settings"]["llama_kv_type"] == "f16"
+    assert c.put("/api/settings", json={"llama_context_length": 147456}, headers=origin).status_code == 200
+    assert c.put("/api/settings", json={"llama_context_length": 155648}, headers=origin).status_code == 422
+    assert c.put("/api/settings", json={"llama_context_length": 139264}, headers=origin).status_code == 200
+
+    # The projector also fits beside a 200K window once the KV cache is Q8,
+    # and that choice survives a switch between the two fast presets.
+    assert c.put("/api/settings", json={"llama_kv_type": "q8_0", "llama_context_length": 204800},
+                 headers=origin).status_code == 200
+    assert c.put("/api/settings", json={"llama_context_length": 205824}, headers=origin).status_code == 422
+    text = c.put("/api/settings", json={"llama_preset": "qwen38_27b_fast", "llama_kv_type": "q8_0",
+                                        "llama_context_length": 204800}, headers=origin)
+    assert text.status_code == 200
+    assert text.json()["settings"]["llama_kv_type"] == "q8_0" and text.json()["settings"]["llama_context_length"] == 204800
+    vision = c.put("/api/settings", json={"llama_preset": "qwen38_27b_fast_vision", "llama_kv_type": "q8_0",
+                                          "llama_context_length": 204800}, headers=origin)
+    assert vision.status_code == 200 and vision.json()["settings"]["llama_kv_type"] == "q8_0"
+    # A stable-preset form still showing its Q8 default can ask for 200K in
+    # the same save as the switch to a fast preset.
+    stable = c.put("/api/settings", json={"llama_preset": "qwen38_27b", "llama_kv_type": "q8_0",
+                                          "llama_context_length": 131072}, headers=origin)
+    assert stable.status_code == 200 and stable.json()["settings"]["llama_kv_type"] == "q8_0"
+    wide = c.put("/api/settings", json={"llama_preset": "qwen38_27b_fast", "llama_kv_type": "q8_0",
+                                        "llama_context_length": 204800}, headers=origin)
+    assert wide.status_code == 200 and wide.json()["settings"]["llama_kv_type"] == "q8_0"
+    assert c.put("/api/settings", json={"llama_preset": "qwen38_27b_fast_vision", "llama_kv_type": "f16",
+                                        "llama_context_length": 139264}, headers=origin).status_code == 200
+
+    # Leaving the fast presets restores the layer-split defaults.
+    back = c.put("/api/settings", json={"llama_preset": "qwen38_27b_mtp_vision"}, headers=origin)
+    assert back.status_code == 200
+    assert back.json()["settings"]["llama_context_length"] == 131072
+    assert back.json()["settings"]["llama_kv_type"] == "q8_0"
+
+
+def test_qwen_fast_is_a_distinct_atomic_preset(instance):
+    c, cfg, app = instance
+    setup(c, cfg)
+    mtp = {"name": "qwen3.8-27b", "status": "ready", "backend": "llama_cpp",
+           "preset": "qwen38_27b_mtp", "vision": False,
+           "speculative": "draft-mtp", "spec_draft_n_max": 2}
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model=mtp).status_code == 200
+    switched = c.put("/api/settings", json={"llama_preset": "qwen38_27b_fast"},
+                     headers={"Origin": "http://testserver"})
+    assert switched.status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "model_switch_required"
+    assert post_admin(c, "/api/agent/command", {"action": "switch_model"}).status_code == 200
+    job = claim(c, cfg).json()["job"]
+    assert job["payload"]["settings"]["llama_preset"] == "qwen38_27b_fast"
+    assert job["payload"]["settings"]["llama_kv_type"] == "f16"
+    assert job["payload"]["settings"]["llama_context_length"] == 180224
+    assert finish(c, cfg, job, result={"message": "模型切换完成"}).status_code == 200
+    # A worker that fell back to MTP alone must not be reported as the fast preset.
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model=dict(
+        mtp, preset="qwen38_27b_fast")).status_code == 200
+    assert c.get("/api/runtime").json()["state"] != "ready"
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model=dict(
+        mtp, preset="qwen38_27b_fast", speculative="draft-mtp,ngram-mod",
+        split_mode="tensor", kv_type="f16", context=180224)).status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "ready"
+
+
+def test_preset_options_fill_the_form_and_keep_the_kv_they_stand_for(instance):
+    c, cfg, app = instance
+    setup(c, cfg)
+    origin = {"Origin": "http://testserver"}
+    status = c.get("/api/status").json()
+    options = {item["id"]: item for item in status["presets"]}
+    # The two measured 200K configurations are choices of their own, next to
+    # the f16 ones; every choice names the preset it loads.
+    assert list(options) == [
+        "qwen38_27b", "qwen38_27b_mtp", "qwen38_27b_mtp_vision",
+        "qwen38_27b_fast", "qwen38_27b_fast_200k",
+        "qwen38_27b_fast_vision", "qwen38_27b_fast_vision_200k",
+        "ornith_35b_a3b", "ornith_35b_a3b_vision"]
+    assert status["settings"]["llama_preset_option"] == "qwen38_27b"
+    target = options["qwen38_27b_fast_vision_200k"]
+    assert target["preset"] == "qwen38_27b_fast_vision" and target["vision"] is True
+    assert target["kv_pinned"] is True and target["max_context"] == 204800
+    assert target["fill"] == {"llama_preset": "qwen38_27b_fast_vision", "llama_alias": "qwen3.8-27b",
+                              "llama_context_length": 204800, "llama_kv_type": "q8_0",
+                              "llama_batch_size": 1024, "llama_ubatch_size": 256, "llama_tensor_split": "1,1"}
+    assert options["qwen38_27b_fast_vision"]["fill"]["llama_kv_type"] == "f16"
+    assert options["qwen38_27b_fast_vision"]["max_context"] == 147456
+    assert options["qwen38_27b"]["kv_pinned"] is False and options["qwen38_27b"]["max_context"] is None
+    for item in options.values():
+        saved = c.put("/api/settings", json={"llama_preset_option": item["id"]}, headers=origin)
+        assert saved.status_code == 200, (item["id"], saved.text)
+        assert {key: saved.json()["settings"][key] for key in item["fill"]} == item["fill"]
+        assert saved.json()["settings"]["llama_preset_option"] == item["id"]
+
+    # Choosing the option is all it takes, coming from a preset whose defaults
+    # are Q8 / 131072 with a hand-edited batch size.
+    assert c.put("/api/settings", json={"llama_preset_option": "qwen38_27b", "llama_batch_size": 512},
+                 headers=origin).status_code == 200
+    picked = c.put("/api/settings", json={"llama_preset_option": "qwen38_27b_fast_vision_200k"}, headers=origin)
+    assert picked.status_code == 200
+    assert {key: picked.json()["settings"][key] for key in target["fill"]} == target["fill"]
+
+    # What the page sends: the option plus every field of the form. A context
+    # below the f16 limit must not flip the 200K option back to f16.
+    form = dict(target["fill"], llama_preset_option="qwen38_27b_fast_vision_200k", llama_context_length=131072)
+    del form["llama_preset"]
+    narrow = c.put("/api/settings", json=form, headers=origin)
+    assert narrow.status_code == 200
+    assert narrow.json()["settings"]["llama_kv_type"] == "q8_0"
+    assert narrow.json()["settings"]["llama_context_length"] == 131072
+    assert narrow.json()["settings"]["llama_preset_option"] == "qwen38_27b_fast_vision_200k"
+    assert c.put("/api/settings", json=dict(form, llama_context_length=205824), headers=origin).status_code == 422
+
+    # The option id never reaches the stored settings, which the worker receives.
+    with sqlite3.connect(app.state.db_path) as db:
+        stored = json.loads(db.execute("SELECT value FROM settings WHERE id=1").fetchone()[0])
+    assert "llama_preset_option" not in stored and stored["llama_kv_type"] == "q8_0"
+    assert "llama_preset_option" not in heartbeat(c, cfg, model=False).json()["settings"]
+    assert c.get("/api/settings").json()["settings"]["llama_preset_option"] == "qwen38_27b_fast_vision_200k"
+
+    # An option is one decision: contradicting it is refused, not guessed at.
+    wrong_kv = c.put("/api/settings", json={"llama_preset_option": "qwen38_27b_fast_vision_200k",
+                                            "llama_kv_type": "f16"}, headers=origin)
+    assert wrong_kv.status_code == 422 and "q8_0" in wrong_kv.text
+    assert c.put("/api/settings", json={"llama_preset_option": "qwen38_27b_fast_vision",
+                                        "llama_kv_type": "q8_0"}, headers=origin).status_code == 422
+    assert c.put("/api/settings", json={"llama_preset_option": "qwen38_27b_fast_200k",
+                                        "llama_preset": "qwen38_27b_fast_vision"}, headers=origin).status_code == 422
+    assert c.put("/api/settings", json={"llama_preset_option": "qwen38_27b_fast_400k"},
+                 headers=origin).status_code == 422
+    assert c.get("/api/settings").json()["settings"]["llama_preset_option"] == "qwen38_27b_fast_vision_200k"
+    # Other presets leave the KV type free; it stays whatever the form says.
+    free = c.put("/api/settings", json={"llama_preset_option": "ornith_35b_a3b", "llama_kv_type": "f16"},
+                 headers=origin)
+    assert free.status_code == 200 and free.json()["settings"]["llama_kv_type"] == "f16"
+    assert free.json()["settings"]["llama_preset_option"] == "ornith_35b_a3b"
+
+    # The static dropdown is what shows before the first status arrives; it
+    # must list the same options, in the same order, with the same wording.
+    page = (main_module.ROOT / "static" / "index.html").read_text(encoding="utf-8")
+    select = page[page.index('<select id="model-preset"'):]
+    select = select[:select.index("</select>")]
+    assert 'name="llama_preset_option"' in select
+    listed = re.findall(r'<option value="([^"]+)">([^<]+)</option>', select)
+    assert listed == [(item["id"], item["label"] + "（" + item["detail"] + "）") for item in options.values()]
+
+
+def test_switching_between_the_136k_and_200k_options_is_a_one_click_switch(instance):
+    c, cfg, app = instance
+    setup(c, cfg)
+    origin = {"Origin": "http://testserver"}
+    assert c.put("/api/settings", json={"llama_preset_option": "qwen38_27b_fast_vision_200k"},
+                 headers=origin).status_code == 200
+    loaded = {"name": "qwen3.8-27b", "status": "ready", "backend": "llama_cpp",
+              "preset": "qwen38_27b_fast_vision", "vision": True, "speculative": "draft-mtp,ngram-mod",
+              "spec_draft_n_max": 2, "split_mode": "tensor", "kv_type": "q8_0", "context": 204800}
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model=loaded).status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "ready"
+
+    # Same preset, other KV type: before 0.9.6 this stayed "ready" and needed
+    # a manual stop and load to take effect.
+    saved = c.put("/api/settings", json={"llama_preset_option": "qwen38_27b_fast_vision"}, headers=origin)
+    assert saved.status_code == 200 and saved.json()["settings"]["llama_kv_type"] == "f16"
+    assert c.get("/api/runtime").json()["state"] == "model_switch_required"
+    assert "qwen38_27b_fast_vision" in c.get("/api/logs").json()["logs"][-1]["message"]
+    blocked = post_admin(c, "/api/chat", {"messages": [{"role": "user", "content": "hello"}]})
+    assert blocked.status_code == 503 and "切换模型" in blocked.text
+    assert post_admin(c, "/api/agent/command", {"action": "load_model"}).status_code == 200
+    job = claim(c, cfg).json()["job"]
+    assert job["payload"]["action"] == "switch_model"
+    assert job["payload"]["settings"]["llama_kv_type"] == "f16"
+    assert job["payload"]["settings"]["llama_context_length"] == 139264
+    assert "llama_preset_option" not in job["payload"]["settings"]
+    assert finish(c, cfg, job, result={"message": "模型切换完成"}).status_code == 200
+    # Still the old process until the worker reports the new KV type.
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model=loaded).status_code == 200
+    assert c.get("/api/runtime").json()["state"] != "ready"
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"],
+                     model=dict(loaded, kv_type="f16", context=139264)).status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "ready"
+    assert post_admin(c, "/api/agent/command", {"action": "load_model"}).status_code == 409
+
+    # A worker that does not report its KV type is taken to match, as before.
+    silent = {key: value for key, value in loaded.items() if key != "kv_type"}
+    assert heartbeat(c, cfg, capabilities=["llama_cpp", "strata"], model=silent).status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "ready"
+
+
 def test_qwen_mtp_is_a_distinct_atomic_preset(instance):
     c, cfg, app = instance
     setup(c, cfg)
@@ -585,6 +808,267 @@ def test_one_click_runtime_start_is_idempotent_and_auto_loads(tmp_path):
         assert bootstrap_token.encode() not in raw and worker_session_token.encode() not in raw
 
 
+def runtime_config(tmp_path):
+    return Config(tmp_path, secrets.token_urlsafe(40), secrets.token_urlsafe(40),
+                  public_url="https://console.example.com", allowed_hosts="testserver",
+                  kaggle_api_token="token", kaggle_runtime_kernel="job579/runtime-test")
+
+
+def launch(client, runtime, pushes=1):
+    """Start a one-click run and register its worker; return (operation_id, worker headers)."""
+    started = post_admin(client, "/api/runtime/start", {})
+    assert started.status_code == 202, started.text
+    wait_until(lambda: len(runtime.pushes) == pushes)
+    operation_id = started.json()["operation_id"]
+    wait_until(lambda: client.get("/api/runtime").json()["state"] == "waiting_worker")
+    exchanged = client.post("/worker/bootstrap", json={"operation_id": operation_id,
+                                                        "bootstrap_token": runtime.pushes[-1][3]})
+    assert exchanged.status_code == 200, exchanged.text
+    return operation_id, {"X-Worker-Key": exchanged.json()["worker_session_token"]}
+
+
+def runs(client, period="30d"):
+    reply = client.get("/api/runtime/runs", params={"period": period})
+    assert reply.status_code == 200, reply.text
+    return reply.json()
+
+
+def shift_run(app, operation_id, **seconds_ago):
+    """Move stored milestones into the past so the durations are known exactly."""
+    now = time.time()
+    with sqlite3.connect(app.state.db_path) as db:
+        for column, ago in seconds_ago.items():
+            db.execute(f"UPDATE runtime_runs SET {column}=? WHERE operation_id=?", (now - ago, operation_id))
+    return now
+
+
+def test_launch_history_records_queue_load_session_and_why_it_ended(tmp_path):
+    runtime = FakeRuntimeClient()
+    config = runtime_config(tmp_path)
+    app = create_app(config, runtime_client=runtime)
+    with TestClient(app) as c:
+        setup(c, config)
+        assert c.put("/api/settings", json={"llama_preset_option": "qwen38_27b_fast_vision_200k"},
+                     headers={"Origin": "http://testserver"}).status_code == 200
+        assert runs(c)["rows"] == [] and runs(c)["summary"]["launches"] == 0
+        operation_id, worker_headers = launch(c, runtime)
+
+        row = runs(c)["rows"][0]
+        assert row["operation_id"] == operation_id[:8] and row["requester"] == {"kind": "admin", "name": "管理站"}
+        assert row["target"] == {"backend": "llama_cpp", "option": "qwen38_27b_fast_vision_200k",
+                                 "preset": "qwen38_27b_fast_vision", "kv_type": "q8_0", "context_length": 204800}
+        # Registered, model not loaded yet: the page shows the launch as loading.
+        assert row["phase"] == "loading" and row["ended_at"] is None and row["ready_seconds"] is None
+        assert row["queue_seconds"] is not None and row["load_seconds"] is None
+        assert runs(c)["summary"]["in_progress"] == 1
+
+        payload = {"worker_id": "worker-1", "status": "online", "model": None, "metrics": {},
+                   "logs": [], "capabilities": ["llama_cpp", "strata"]}
+        assert c.post("/worker/heartbeat", headers=worker_headers, json=payload).status_code == 200
+        job = c.get("/worker/jobs", headers=worker_headers, params={"worker_id": "worker-1"}).json()["job"]
+        assert job["payload"]["action"] == "load_model"
+        assert c.post("/worker/jobs/" + job["id"] + "/result", headers=worker_headers,
+                      json={"worker_id": "worker-1", "lease_token": job["lease_token"],
+                            "status": "completed", "result": {"message": "模型加载完成"}}).status_code == 200
+        model = {"name": "qwen3.8-27b", "status": "ready", "backend": "llama_cpp",
+                 "preset": "qwen38_27b_fast_vision", "vision": True, "speculative": "draft-mtp,ngram-mod",
+                 "spec_draft_n_max": 2, "split_mode": "tensor", "kv_type": "q8_0", "context": 204800}
+        payload.update(status="ready", model=model)
+        assert c.post("/worker/heartbeat", headers=worker_headers, json=payload).status_code == 200
+        ready = runs(c)["rows"][0]
+        assert ready["phase"] == "ready" and ready["ready_seconds"] is not None
+        assert ready["model"] == {"name": "qwen3.8-27b", "preset": "qwen38_27b_fast_vision",
+                                  "context": 204800, "kv_type": "q8_0", "vision": True}
+
+        # Give the milestones known ages: 5 s to submit, 11 min in the Kaggle
+        # queue, 50 s to load, then the worker reports an idle stop.
+        shift_run(app, operation_id, requested_at=2000, submitted_at=1995, worker_at=1335, ready_at=1285)
+        # Later heartbeats never move a milestone that was already recorded.
+        assert c.post("/worker/heartbeat", headers=worker_headers, json=payload).status_code == 200
+        payload.update(status="stopped", model={"name": "", "status": "stopped"}, stop_reason="idle",
+                       runtime_seconds=1300.5)
+        assert c.post("/worker/heartbeat", headers=worker_headers, json=payload).status_code == 200
+        assert c.get("/api/runtime").json()["state"] == "stopped"
+
+        result = runs(c)
+        done = result["rows"][0]
+        assert done["phase"] == "ended" and done["end_reason"] == "idle" and done["error"] is None
+        assert done["submit_seconds"] == pytest.approx(5, abs=0.2)
+        assert done["queue_seconds"] == pytest.approx(660, abs=0.2)
+        assert done["load_seconds"] == pytest.approx(50, abs=0.2)
+        assert done["ready_seconds"] == pytest.approx(715, abs=0.2)
+        assert done["session_seconds"] == 1300.5
+        assert done["total_seconds"] == pytest.approx(2000, abs=2)
+        summary = result["summary"]
+        assert (summary["launches"], summary["ready"], summary["not_ready"], summary["in_progress"]) == (1, 1, 0, 0)
+        assert summary["queue_median_seconds"] == pytest.approx(660, abs=0.2)
+        assert summary["queue_max_seconds"] == pytest.approx(660, abs=0.2)
+        assert summary["load_median_seconds"] == pytest.approx(50, abs=0.2)
+        assert summary["ready_median_seconds"] == pytest.approx(715, abs=0.2)
+        assert summary["session_total_seconds"] == 1300.5
+        assert summary["end_reasons"] == {"idle": 1} and summary["idle_stops"] == 1
+        assert summary["idle_relaunches"] == 0
+
+        # A closed launch is final: a stray late report changes nothing, and a
+        # legacy worker key never writes launch history at all.
+        legacy = dict(payload, status="stopped", stop_reason="shutdown", runtime_seconds=9)
+        assert c.post("/worker/heartbeat", headers=headers(config), json=legacy).status_code == 200
+        assert runs(c)["rows"][0]["end_reason"] == "idle" and runs(c)["rows"][0]["session_seconds"] == 1300.5
+
+        # A second launch four minutes after the idle stop counts as a relaunch.
+        with sqlite3.connect(app.state.db_path) as db:
+            db.execute("UPDATE runtime_state SET requested_at=requested_at-120 WHERE id=1")
+            db.execute("UPDATE runtime_runs SET ended_at=? WHERE operation_id=?", (time.time() - 240, operation_id))
+        second, second_headers = launch(c, runtime, pushes=2)
+        assert second != operation_id
+        result = runs(c)
+        assert [row["operation_id"] for row in result["rows"]] == [second[:8], operation_id[:8]]
+        assert result["rows"][0]["after_idle_seconds"] == pytest.approx(240, abs=3)
+        assert result["rows"][1]["after_idle_seconds"] is None
+        assert result["summary"]["launches"] == 2 and result["summary"]["idle_relaunches"] == 1
+        assert result["summary"]["in_progress"] == 1
+
+        # Periods are cut by when the launch was requested.
+        shift_run(app, operation_id, requested_at=3 * 86400)
+        assert len(runs(c, "today")["rows"]) == 1 and len(runs(c, "7d")["rows"]) == 2
+        assert runs(c, "today")["rows"][0]["after_idle_seconds"] is not None
+        assert c.get("/api/runtime/runs", params={"period": "1h"}).status_code == 422
+        assert c.get("/api/runtime/runs", params={"limit": 1}).json()["summary"]["launches"] == 2
+        assert len(c.get("/api/runtime/runs", params={"limit": 1}).json()["rows"]) == 1
+
+        # Admin only, and nothing secret is stored or returned.
+        text = c.get("/api/runtime/runs").text
+        for secret in (config.worker_key, runtime.pushes[0][3], runtime.pushes[1][3],
+                       worker_headers["X-Worker-Key"], second_headers["X-Worker-Key"], operation_id, second):
+            assert secret not in text
+        assert post_admin(c, "/api/logout", {}).status_code == 200
+        assert c.get("/api/runtime/runs").status_code == 401
+        key_auth = {"Authorization": "Bearer sk-strata-not-a-key"}
+        assert c.get("/api/runtime/runs", headers=key_auth).status_code == 401
+
+
+def test_launch_history_closes_runs_that_never_became_ready(tmp_path):
+    runtime = BlockingFailRuntimeClient()
+    config = runtime_config(tmp_path)
+    app = create_app(config, runtime_client=runtime)
+    with TestClient(app) as c:
+        setup(c, config)
+        # The Kaggle push fails: the launch ends there, with the reason.
+        assert post_admin(c, "/api/runtime/start", {}).status_code == 202
+        assert runtime.entered.wait(3)
+        assert runs(c)["rows"][0]["phase"] == "submitting"
+        runtime.release.set()
+        wait_until(lambda: c.get("/api/runtime").json()["state"] == "failed")
+        failed = runs(c)["rows"][0]
+        assert failed["phase"] == "ended" and failed["end_reason"] == "submit_failed"
+        assert failed["error"] == "Kaggle Notebook 启动提交失败" and failed["queue_seconds"] is None
+        summary = runs(c)["summary"]
+        assert (summary["launches"], summary["ready"], summary["not_ready"]) == (1, 0, 1)
+        assert summary["queue_median_seconds"] is None and summary["ready_max_seconds"] is None
+
+    # Cancelled before the notebook was submitted. The maintenance loop claims
+    # a queued launch within 3 s, so the row is written directly and the stop
+    # follows at once; the rare attempt the loop wins is simply repeated.
+    runtime = FakeRuntimeClient()
+    config = runtime_config(tmp_path / "cancel")
+    app = create_app(config, runtime_client=runtime)
+    with TestClient(app) as c:
+        setup(c, config)
+        cancelled = None
+        for attempt in range(20):
+            operation_id = "c%031d" % attempt
+            with sqlite3.connect(app.state.db_path) as db:
+                now = time.time()
+                db.execute("UPDATE runtime_state SET operation_id=?,state='queued_local',stop_requested=0,"
+                           "kernel_status=NULL,requested_at=? WHERE id=1", (operation_id, now))
+                db.execute("INSERT INTO runtime_runs(operation_id,requested_by,requested_at) VALUES(?,?,?)",
+                           (operation_id, "admin", now))
+            stopped = post_admin(c, "/api/runtime/stop", {})
+            row = next(item for item in runs(c)["rows"] if item["operation_id"] == operation_id[:8])
+            if stopped.status_code == 200:
+                cancelled = row
+                break
+            assert stopped.status_code == 202 and row["stop_requested_at"] is not None
+        assert cancelled and cancelled["phase"] == "ended"
+        assert cancelled["end_reason"] == "cancelled_before_submit" and cancelled["submitted_at"] is None
+
+
+def test_launch_history_records_a_failed_load_and_the_kaggle_ending(tmp_path):
+    runtime = FakeRuntimeClient(statuses=[{"status": "running", "failure_message": None}])
+    config = runtime_config(tmp_path)
+    app = create_app(config, runtime_client=runtime)
+    with TestClient(app) as c:
+        setup(c, config)
+        operation_id, worker_headers = launch(c, runtime)
+        payload = {"worker_id": "worker-1", "status": "online", "model": None, "metrics": {},
+                   "logs": [], "capabilities": ["llama_cpp", "strata"]}
+        assert c.post("/worker/heartbeat", headers=worker_headers, json=payload).status_code == 200
+        job = c.get("/worker/jobs", headers=worker_headers, params={"worker_id": "worker-1"}).json()["job"]
+        assert c.post("/worker/jobs/" + job["id"] + "/result", headers=worker_headers,
+                      json={"worker_id": "worker-1", "lease_token": job["lease_token"],
+                            "status": "failed", "error": "模型加载失败：显存不足"}).status_code == 200
+        row = runs(c)["rows"][0]
+        # The session is still up, so the launch stays open with its error.
+        assert row["phase"] == "loading" and row["error"] == "模型加载失败：显存不足" and row["ready_at"] is None
+
+        # The worker dies without a last heartbeat; Kaggle's status closes the row.
+        runtime.statuses = [{"status": "error", "failure_message": "notebook crashed"}]
+        with sqlite3.connect(app.state.db_path) as db:
+            db.execute("UPDATE worker SET last_seen=?", (time.time() - 90,))
+            db.execute("UPDATE runtime_state SET last_checked_at=0 WHERE id=1")
+        wait_until(lambda: runs(c)["rows"][0]["phase"] == "ended", timeout=12)
+        ended = runs(c)["rows"][0]
+        assert ended["end_reason"] == "kaggle_error" and ended["error"] == "模型加载失败：显存不足"
+        summary = runs(c)["summary"]
+        assert summary["not_ready"] == 1 and summary["end_reasons"] == {"kaggle_error": 1}
+
+
+def test_launch_history_is_created_on_upgrade_and_closes_superseded_rows(tmp_path):
+    config = runtime_config(tmp_path)
+    runtime = FakeRuntimeClient()
+    app = create_app(config, runtime_client=runtime)
+    with TestClient(app) as c:
+        setup(c, config)
+    # A 0.9.5 database: no launch table, no shutdown_done_at column.
+    with sqlite3.connect(app.state.db_path) as db:
+        db.execute("DROP TABLE runtime_runs")
+        db.execute("ALTER TABLE runtime_state DROP COLUMN shutdown_done_at")
+    upgraded = create_app(config, runtime_client=runtime)
+    with TestClient(upgraded) as c:
+        assert post_admin(c, "/api/login", {"username": "admin",
+                                            "password": "test-password-long!"}).status_code == 200
+        assert runs(c) == {"period": "30d", "now": pytest.approx(time.time(), abs=5), "rows": [], "summary": {
+            "launches": 0, "ready": 0, "not_ready": 0, "in_progress": 0,
+            "queue_median_seconds": None, "queue_max_seconds": None,
+            "load_median_seconds": None, "load_max_seconds": None,
+            "ready_median_seconds": None, "ready_max_seconds": None,
+            "session_total_seconds": 0, "end_reasons": {}, "idle_stops": 0, "idle_relaunches": 0}}
+        # A row left open by an earlier build (or a crash) is closed, not left
+        # "in progress" forever, when the next launch starts.
+        with sqlite3.connect(upgraded.state.db_path) as db:
+            db.execute("INSERT INTO runtime_runs(operation_id,requested_by,requested_at) VALUES(?,?,?)",
+                       ("d" * 32, "api:gone", time.time() - 600))
+        operation_id, _ = launch(c, runtime)
+        rows = {row["operation_id"]: row for row in runs(c)["rows"]}
+        assert rows["d" * 8]["end_reason"] == "superseded" and rows["d" * 8]["phase"] == "ended"
+        assert rows["d" * 8]["requester"] == {"kind": "api", "name": "已删除的 API Key"}
+        assert rows[operation_id[:8]]["phase"] == "loading"
+
+
+def test_wake_key_is_named_in_the_launch_history(tmp_path):
+    runtime = FakeRuntimeClient()
+    config = runtime_config(tmp_path)
+    app = create_app(config, runtime_client=runtime)
+    with TestClient(app) as c:
+        setup(c, config)
+        wake = post_admin(c, "/api/keys", {"name": "wake-client", "can_wake": True}).json()
+        assert c.post("/v1/runtime/wake", headers={"Authorization": "Bearer " + wake["key"]}).status_code == 202
+        wait_until(lambda: len(runtime.pushes) == 1)
+        row = runs(c)["rows"][0]
+        assert row["requester"] == {"kind": "api", "name": "wake-client"}
+        assert wake["key"] not in c.get("/api/runtime/runs").text and wake["id"] not in c.get("/api/runtime/runs").text
+
+
 def test_runtime_bootstrap_rejects_invalid_expired_and_redacts_tokens(tmp_path):
     runtime = FakeRuntimeClient()
     config = Config(tmp_path, secrets.token_urlsafe(40), secrets.token_urlsafe(40),
@@ -719,6 +1203,73 @@ def test_stop_requested_before_worker_connects_prevents_auto_load(tmp_path):
         assert c.get("/api/runtime").json()["state"] == "stopped"
         assert c.get("/worker/jobs", headers=runtime_headers,
                      params={"worker_id": "worker-1"}).status_code == 401
+
+
+def test_stop_does_not_queue_a_second_shutdown_before_the_last_heartbeat(tmp_path):
+    runtime = FakeRuntimeClient()
+    config = runtime_config(tmp_path)
+    app = create_app(config, runtime_client=runtime)
+
+    def shutdown_jobs():
+        with sqlite3.connect(app.state.db_path) as db:
+            return [status for (status,) in db.execute(
+                "SELECT status FROM jobs WHERE type='command' ORDER BY created_at")]
+
+    with TestClient(app) as c:
+        setup(c, config)
+        operation_id, worker_headers = launch(c, runtime)
+        payload = {"worker_id": "worker-1", "status": "ready", "metrics": {}, "logs": [],
+                   "capabilities": ["llama_cpp", "strata"],
+                   "model": {"name": "test-model", "status": "ready", "backend": "llama_cpp", "preset": "qwen38_27b"}}
+        assert c.post("/worker/heartbeat", headers=worker_headers, json=payload).status_code == 200
+        assert post_admin(c, "/api/runtime/stop", {}).status_code == 202
+        job = c.get("/worker/jobs", headers=worker_headers, params={"worker_id": "worker-1"}).json()["job"]
+        assert job["payload"]["action"] == "shutdown"
+        assert c.post("/worker/jobs/" + job["id"] + "/result", headers=worker_headers,
+                      json={"worker_id": "worker-1", "lease_token": job["lease_token"],
+                            "status": "completed", "result": {"message": "Worker 会话已结束"}}).status_code == 200
+        assert shutdown_jobs() == ["completed"]
+
+        # The gap between the finished shutdown and the worker's last report:
+        # the maintenance loop, an ordinary heartbeat and a second click on
+        # stop all used to queue another shutdown here.
+        time.sleep(3.5)
+        assert c.post("/worker/heartbeat", headers=worker_headers, json=payload).status_code == 200
+        assert post_admin(c, "/api/runtime/stop", {}).status_code == 202
+        assert c.get("/api/runtime").json()["state"] == "stopping"
+        assert shutdown_jobs() == ["completed"]
+        assert c.get("/worker/jobs", headers=worker_headers, params={"worker_id": "worker-1"}).json()["job"] is None
+        messages = [line["message"] for line in c.get("/api/logs").json()["logs"]]
+        assert not any("按先前停止请求立即结束" in message for message in messages)
+
+        payload.update(status="stopped", model={"name": "", "status": "stopped"}, stop_reason="shutdown")
+        assert c.post("/worker/heartbeat", headers=worker_headers, json=payload).status_code == 200
+        assert c.get("/api/runtime").json()["state"] == "stopped"
+        assert shutdown_jobs() == ["completed"]
+        row = runs(c)["rows"][0]
+        assert row["end_reason"] == "shutdown" and row["stop_requested_at"] is not None
+        recent = [item for item in c.get("/api/status").json()["recent_jobs"] if item["type"] == "command"]
+        assert [item["status"] for item in recent] == ["completed"]
+
+
+def test_a_worker_that_ignores_shutdown_is_asked_again_after_a_minute(tmp_path):
+    runtime = FakeRuntimeClient()
+    config = runtime_config(tmp_path)
+    app = create_app(config, runtime_client=runtime)
+    with TestClient(app) as c:
+        setup(c, config)
+        assert heartbeat(c, config, capabilities=["llama_cpp", "strata"]).status_code == 200
+        assert post_admin(c, "/api/runtime/stop", {}).status_code == 202
+        job = claim(c, config).json()["job"]
+        assert finish(c, config, job, result={"message": "Worker 会话已结束"}).status_code == 200
+        assert heartbeat(c, config, capabilities=["llama_cpp", "strata"]).status_code == 200
+        assert claim(c, config).json()["job"] is None
+        # Still heartbeating a minute later: the stop is not silently dropped.
+        with sqlite3.connect(app.state.db_path) as db:
+            db.execute("UPDATE runtime_state SET shutdown_done_at=shutdown_done_at-61 WHERE id=1")
+        assert heartbeat(c, config, capabilities=["llama_cpp", "strata"]).status_code == 200
+        again = claim(c, config).json()["job"]
+        assert again and again["payload"]["action"] == "shutdown" and again["id"] != job["id"]
 
 
 def test_wake_cannot_cancel_an_in_flight_stop(tmp_path):
@@ -1046,6 +1597,81 @@ def test_official_complete_preserves_model_load_failure(tmp_path):
         state = c.get("/api/runtime").json()
         assert state["state"] == "failed"
         assert state["last_error"] == "模型加载失败：显存不足"
+
+
+def test_official_cancel_before_worker_connects_allows_restart(tmp_path):
+    # Kaggle reports a cancelled run as CANCEL_REQUESTED, then CANCEL_ACKNOWLEDGED.
+    runtime = FakeRuntimeClient(statuses=[{"status": "cancelling", "failure_message": None},
+                                          {"status": "cancelled", "failure_message": None}])
+    config = Config(tmp_path, secrets.token_urlsafe(40), secrets.token_urlsafe(40),
+                    public_url="https://console.example.com", allowed_hosts="testserver",
+                    kaggle_api_token="token", kaggle_runtime_kernel="job579/runtime-test")
+    app = create_app(config, runtime_client=runtime)
+    with TestClient(app) as c:
+        setup(c, config)
+        with sqlite3.connect(app.state.db_path) as db:
+            old = time.time() - 90
+            db.execute("UPDATE runtime_state SET operation_id='cancel-op',state='waiting_worker',requested_at=?,"
+                       "updated_at=?,last_checked_at=0,kernel_status='queued',error=NULL WHERE id=1", (old - 60, old))
+
+        wait_until(lambda: runtime.status_calls > 0, timeout=12)
+        wait_until(lambda: c.get("/api/runtime").json()["kernel_status"] in ("cancelling", "cancelled"), timeout=12)
+        with sqlite3.connect(app.state.db_path) as db:
+            db.execute("UPDATE runtime_state SET last_checked_at=0 WHERE id=1")
+        # The reconcile loop sleeps up to 3 s between passes.
+        wait_until(lambda: c.get("/api/runtime").json()["state"] == "failed", timeout=12)
+        state = c.get("/api/runtime").json()
+        assert state["state"] == "failed" and state["kernel_status"] == "cancelled"
+        assert "取消" in state["last_error"]
+        assert state["can_start"] is True
+
+
+def test_runtime_bootstrap_outlives_a_long_kaggle_queue(tmp_path):
+    # A real run waited about 3 hours for a T4 x2 and was then rejected with
+    # HTTP 401, because the one-time bootstrap used to expire after 20 minutes.
+    runtime = FakeRuntimeClient(statuses=[{"status": "queued", "failure_message": None}])
+    config = Config(tmp_path, secrets.token_urlsafe(40), secrets.token_urlsafe(40),
+                    public_url="https://console.example.com", allowed_hosts="testserver",
+                    kaggle_api_token="token", kaggle_runtime_kernel="job579/runtime-test")
+    app = create_app(config, runtime_client=runtime)
+    with TestClient(app) as c:
+        setup(c, config)
+        started = post_admin(c, "/api/runtime/start", {})
+        wait_until(lambda: len(runtime.pushes) == 1)
+        operation_id, bootstrap_token = started.json()["operation_id"], runtime.pushes[0][3]
+        with sqlite3.connect(app.state.db_path) as db:
+            expires_at, state = db.execute(
+                "SELECT bootstrap_expires_at,state FROM runtime_state WHERE id=1").fetchone()
+        assert expires_at - time.time() > 6 * 3600
+        # Simulate the queue: the launch is 4 hours old when the Notebook starts.
+        with sqlite3.connect(app.state.db_path) as db:
+            db.execute("UPDATE runtime_state SET requested_at=requested_at-14400,"
+                       "updated_at=updated_at-14400,bootstrap_expires_at=bootstrap_expires_at-14400 WHERE id=1")
+        exchanged = c.post("/worker/bootstrap", json={"operation_id": operation_id,
+                                                       "bootstrap_token": bootstrap_token})
+        assert exchanged.status_code == 200
+        assert exchanged.json()["expires_at"] - time.time() > 3 * 3600
+
+
+def test_official_error_after_expired_bootstrap_explains_the_queue(tmp_path):
+    runtime = FakeRuntimeClient(statuses=[{"status": "error", "failure_message": None}])
+    config = Config(tmp_path, secrets.token_urlsafe(40), secrets.token_urlsafe(40),
+                    public_url="https://console.example.com", allowed_hosts="testserver",
+                    kaggle_api_token="token", kaggle_runtime_kernel="job579/runtime-test")
+    app = create_app(config, runtime_client=runtime)
+    with TestClient(app) as c:
+        setup(c, config)
+        with sqlite3.connect(app.state.db_path) as db:
+            old = time.time() - 90
+            db.execute("UPDATE runtime_state SET operation_id='queue-op',state='waiting_worker',requested_at=?,"
+                       "updated_at=?,last_checked_at=0,kernel_status='queued',error=NULL,bootstrap_hash='x',"
+                       "bootstrap_expires_at=?,bootstrap_used_at=NULL,worker_session_hash=NULL WHERE id=1",
+                       (old - 60, old, old))
+        # The reconcile loop sleeps up to 3 s between passes.
+        wait_until(lambda: c.get("/api/runtime").json()["state"] == "failed", timeout=12)
+        state = c.get("/api/runtime").json()
+        assert state["kernel_status"] == "error" and state["can_start"] is True
+        assert "排队" in state["last_error"] and "登记" in state["last_error"]
 
 
 def test_llama_auto_batch_validation(instance):

@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -36,7 +37,7 @@ from app.kaggle_runtime import KaggleRuntimeClient, KaggleRuntimeError
 
 ROOT = Path(__file__).resolve().parent.parent
 SESSION_COOKIE = "strata_session"
-VERSION = "0.8.1"
+VERSION = "0.9.6"
 WORKER_TTL = 45
 JOB_TIMEOUT = 1800
 MAX_BODY = 4 * 1024 * 1024
@@ -50,7 +51,11 @@ STREAM_BATCH_MAX_BYTES = 512 * 1024
 STREAM_JOB_MAX_BATCHES = 4096
 STREAM_JOB_MAX_BYTES = 32 * 1024 * 1024
 STREAM_HEARTBEAT_SECONDS = 10
-RUNTIME_BOOTSTRAP_TTL = 20 * 60
+# The one-time bootstrap must outlive the Kaggle GPU queue: a run that waited
+# about 3 hours for a T4 x2 was rejected with HTTP 401 under the old 20 minutes.
+# It stays single-use, bound to one operation, and is cleared as soon as the
+# official run ends, a stop converges, or a new operation starts.
+RUNTIME_BOOTSTRAP_TTL = 12 * 60 * 60
 RUNTIME_BOOTSTRAP_RETRY = 60
 RUNTIME_WORKER_SESSION_TTL = 3 * 60 * 60 + 10 * 60
 TERMINAL = ("completed", "failed", "cancelled", "expired")
@@ -60,6 +65,16 @@ LLAMA_DATASET_PREFIXES = (
     "/kaggle/input/datasets/job579/ornith-1-5-35b-a3b-q4-runtime",
     "/kaggle/input/ornith-1-5-35b-a3b-q4-runtime",
 )
+# Dual-T4 limits per KV type, measured 2026-11-14/15; the worker enforces the
+# same values. Q8 KV is half the size, so both presets reach 200K with it. At
+# short context it decodes as fast as f16 (about 33 tok/s); deep in the window
+# it is slower (about 15 against 21 at 150K tokens), so f16 stays the default.
+QWEN_FAST_CONTEXT = 180224
+QWEN_FAST_VISION_CONTEXT = 139264
+QWEN_FAST_MAX_CONTEXT = {
+    "qwen38_27b_fast": {"f16": 184320, "q8_0": 204800},
+    "qwen38_27b_fast_vision": {"f16": 147456, "q8_0": 204800},
+}
 LLAMA_PRESET_DEFAULTS = {
     "qwen38_27b": {
         "llama_alias": "qwen3.8-27b",
@@ -85,6 +100,24 @@ LLAMA_PRESET_DEFAULTS = {
         "llama_ubatch_size": 256,
         "llama_tensor_split": "1,1",
     },
+    # Tensor split + MTP + ngram-mod. f16 KV is the fastest and the default;
+    # the measured alternatives and limits are in QWEN_FAST_MAX_CONTEXT.
+    "qwen38_27b_fast": {
+        "llama_alias": "qwen3.8-27b",
+        "llama_context_length": QWEN_FAST_CONTEXT,
+        "llama_kv_type": "f16",
+        "llama_batch_size": 1024,
+        "llama_ubatch_size": 256,
+        "llama_tensor_split": "1,1",
+    },
+    "qwen38_27b_fast_vision": {
+        "llama_alias": "qwen3.8-27b",
+        "llama_context_length": QWEN_FAST_VISION_CONTEXT,
+        "llama_kv_type": "f16",
+        "llama_batch_size": 1024,
+        "llama_ubatch_size": 256,
+        "llama_tensor_split": "1,1",
+    },
     "ornith_35b_a3b": {
         "llama_alias": "ornith-1.5-35b-a3b",
         "llama_context_length": 131072,
@@ -102,6 +135,59 @@ LLAMA_PRESET_DEFAULTS = {
         "llama_tensor_split": "1,1",
     },
 }
+
+
+def _preset_option(option_id, preset, label, detail, vision, note, **overrides):
+    fill = {"llama_preset": preset, **LLAMA_PRESET_DEFAULTS[preset], **overrides}
+    limits = QWEN_FAST_MAX_CONTEXT.get(preset)
+    return {"id": option_id, "preset": preset, "label": label, "detail": detail, "vision": vision,
+            "kv_pinned": bool(limits),
+            "max_context": limits[fill["llama_kv_type"]] if limits else None,
+            "note": note, "fill": fill}
+
+
+# What the "模型预设" dropdown offers. An option is a preset plus, for the two
+# fast presets, the KV type: f16 decodes faster deep in the window, q8_0 is
+# what reaches 200K. Choosing an option fills the form from `fill`. Settings
+# keep storing only the preset and the KV type; the option is derived from
+# them, so the worker and older builds never see an option id.
+# The notes quote production measurements only (docs/PROJECT_STATE.md).
+LLAMA_PRESET_OPTIONS = [
+    _preset_option("qwen38_27b", "qwen38_27b", "Qwen3.8-27B", "稳定 / 较慢", True,
+                   "layer 切分，不带推测解码；自动加载视觉投影。"),
+    _preset_option("qwen38_27b_mtp", "qwen38_27b_mtp", "Qwen3.8-27B", "MTP n=2 / 纯文本实验", False,
+                   "layer 切分 + MTP n=2；不加载视觉投影。"),
+    _preset_option("qwen38_27b_mtp_vision", "qwen38_27b_mtp_vision", "Qwen3.8-27B", "MTP n=2 / 视觉实验", True,
+                   "layer 切分 + MTP n=2，同时加载视觉投影。"),
+    _preset_option("qwen38_27b_fast", "qwen38_27b_fast", "Qwen3.8-27B", "高速 / 纯文本 176K", False,
+                   "F16 KV，窗口最多 184,320。上下文深时比 200K 选项快："
+                   "实测 10.5 万处 22.7 对 20.7 tok/s（不同会话）。"),
+    _preset_option("qwen38_27b_fast_200k", "qwen38_27b_fast", "Qwen3.8-27B", "高速 / 纯文本 200K", False,
+                   "Q8 KV，窗口 204,800。短对话与 176K 选项一样快，越深越慢："
+                   "实测 10.5 万处 20.7、19 万处 16.2 tok/s。",
+                   llama_kv_type="q8_0", llama_context_length=204800),
+    _preset_option("qwen38_27b_fast_vision", "qwen38_27b_fast_vision", "Qwen3.8-27B", "高速 / 视觉 136K", True,
+                   "F16 KV，窗口最多 147,456。上下文深时预计比 200K 选项快"
+                   "（纯文本实测 10.5 万处 22.7 对 20.7 tok/s；视觉的同会话对照还没测）。"),
+    _preset_option("qwen38_27b_fast_vision_200k", "qwen38_27b_fast_vision", "Qwen3.8-27B", "高速 / 视觉 200K", True,
+                   "Q8 KV，窗口 204,800。空上下文约 30 tok/s，越深越慢："
+                   "实测 1.6 万处约 24、9.6 万处约 18、19 万处约 15.5 tok/s（中文长文再低 4–7）。",
+                   llama_kv_type="q8_0", llama_context_length=204800),
+    _preset_option("ornith_35b_a3b", "ornith_35b_a3b", "Ornith-1.5-35B-A3B", "MoE / 高速文本", False,
+                   "MoE 文本模型；不加载视觉投影。"),
+    _preset_option("ornith_35b_a3b_vision", "ornith_35b_a3b_vision", "Ornith-1.5-35B-A3B", "MoE / 视觉", True,
+                   "MoE 模型，同时加载配套视觉投影。"),
+]
+LLAMA_PRESET_OPTION_BY_ID = {option["id"]: option for option in LLAMA_PRESET_OPTIONS}
+
+
+def preset_option_id(preset, kv_type):
+    """The dropdown option that a saved (or loaded) preset and KV type stand for."""
+    if preset in QWEN_FAST_MAX_CONTEXT and kv_type == "q8_0":
+        return preset + "_200k"
+    return preset
+
+
 # Stored settings are merged over these, so older databases gain new fields.
 DEFAULT_SETTINGS = {"public_url": "", "backend": "llama_cpp", "auto_load": False,
                     "model_path": "", "strata_path": "/kaggle/working/Strata",
@@ -186,7 +272,12 @@ class Settings(StrictModel):
     llama_model_path: str | None = Field(default=None, max_length=2048)
     llama_server_path: str | None = Field(default=None, max_length=2048)
     llama_mmproj_path: str | None = Field(default=None, max_length=2048)
-    llama_preset: Literal["qwen38_27b", "qwen38_27b_mtp", "qwen38_27b_mtp_vision", "ornith_35b_a3b", "ornith_35b_a3b_vision"] | None = None
+    llama_preset: Literal["qwen38_27b", "qwen38_27b_mtp", "qwen38_27b_mtp_vision",
+                          "qwen38_27b_fast", "qwen38_27b_fast_vision",
+                          "ornith_35b_a3b", "ornith_35b_a3b_vision"] | None = None
+    # The dropdown choice (an id from LLAMA_PRESET_OPTIONS). It sets the preset
+    # and fills whatever else the request leaves out; it is never stored.
+    llama_preset_option: str | None = Field(default=None, max_length=64)
     llama_alias: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
     llama_context_length: int | None = Field(default=None, ge=1024, le=1048576)
     llama_kv_type: Literal["q8_0", "f16"] | None = None
@@ -204,6 +295,13 @@ class Settings(StrictModel):
         if p.scheme != "https" or not p.hostname or p.username or p.password or p.query or p.fragment or p.path not in ("", "/"):
             raise ValueError("公开地址必须是 HTTPS 域名，不含路径、查询或凭据")
         return v.rstrip("/")
+
+    @field_validator("llama_preset_option")
+    @classmethod
+    def check_preset_option(cls, v):
+        if v is not None and v not in LLAMA_PRESET_OPTION_BY_ID:
+            raise ValueError("未知的模型预设选项")
+        return v
 
     @field_validator("model_path", "strata_path", "llama_model_path", "llama_server_path", "llama_mmproj_path")
     @classmethod
@@ -378,6 +476,8 @@ class Heartbeat(StrictModel):
     logs: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     # Backends this worker build can load; older workers send none (Strata only).
     capabilities: list[str] = Field(default_factory=list, max_length=16)
+    # Why the session ended; sent only with the final `stopped` heartbeat.
+    stop_reason: str | None = Field(default=None, max_length=32, pattern=r"^[a-z_]+$")
 
 
 class JobResult(StrictModel):
@@ -475,8 +575,26 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                     bootstrap_expires_at REAL,
                     bootstrap_used_at REAL,
                     worker_session_hash TEXT,
-                    worker_session_expires_at REAL
+                    worker_session_expires_at REAL,
+                    shutdown_done_at REAL
                 );
+                CREATE TABLE IF NOT EXISTS runtime_runs(
+                    operation_id TEXT PRIMARY KEY,
+                    requested_by TEXT,
+                    requested_at REAL NOT NULL,
+                    target TEXT,
+                    submitted_at REAL,
+                    running_at REAL,
+                    worker_at REAL,
+                    ready_at REAL,
+                    stop_requested_at REAL,
+                    ended_at REAL,
+                    end_reason TEXT,
+                    error TEXT,
+                    worker_runtime_seconds REAL,
+                    model TEXT
+                );
+                CREATE INDEX IF NOT EXISTS runtime_runs_requested ON runtime_runs(requested_at DESC);
                 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status,created_at);
                 CREATE INDEX IF NOT EXISTS job_stream_batches_job ON job_stream_batches(job_id,seq);
                 CREATE INDEX IF NOT EXISTS request_logs_created ON request_logs(created_at DESC);
@@ -509,6 +627,7 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                 "bootstrap_used_at": "REAL",
                 "worker_session_hash": "TEXT",
                 "worker_session_expires_at": "REAL",
+                "shutdown_done_at": "REAL",
             }.items():
                 if name not in runtime_columns:
                     c.execute(f"ALTER TABLE runtime_state ADD COLUMN {name} {definition}")
@@ -711,15 +830,24 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
         target = config.get("llama_preset", "qwen38_27b")
         if model.get("backend") != "llama_cpp" or worker_model_preset(worker) != target:
             return False
-        mtp_requirements = {
-            "qwen38_27b_mtp": (False, 2),
-            "qwen38_27b_mtp_vision": (True, 2),
+        spec_requirements = {
+            "qwen38_27b_mtp": (False, "draft-mtp", 2),
+            "qwen38_27b_mtp_vision": (True, "draft-mtp", 2),
+            "qwen38_27b_fast": (False, "draft-mtp,ngram-mod", 2),
+            "qwen38_27b_fast_vision": (True, "draft-mtp,ngram-mod", 2),
         }
-        if target in mtp_requirements:
-            vision, n_max = mtp_requirements[target]
-            return (model.get("vision") is vision
-                    and model.get("speculative") == "draft-mtp"
-                    and model.get("spec_draft_n_max") == n_max)
+        if target in spec_requirements:
+            vision, speculative, n_max = spec_requirements[target]
+            if not (model.get("vision") is vision
+                    and model.get("speculative") == speculative
+                    and model.get("spec_draft_n_max") == n_max):
+                return False
+        # The fast presets come as an f16 option and a q8_0 (200K) option, so a
+        # different KV type is a different target. Workers report it for
+        # these presets; one that does not is taken to match.
+        loaded_kv = model.get("kv_type")
+        if target in QWEN_FAST_MAX_CONTEXT and loaded_kv and loaded_kv != config.get("llama_kv_type"):
+            return False
         return True
 
     def ready(worker, config=None):
@@ -744,6 +872,58 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
         message = ("runtime-session\0" + operation_id + "\0" + bootstrap_token).encode()
         signature = hmac.new(cfg.worker_key.encode(), message, hashlib.sha256).hexdigest()
         return "sk-strata-runtime-" + signature
+
+    # Launch history: one runtime_runs row per one-click operation. Each
+    # milestone keeps the first time it was seen, and a closed row never
+    # changes, so a late or repeated event cannot rewrite a finished launch.
+    run_milestones = ("submitted_at", "running_at", "worker_at", "ready_at", "stop_requested_at")
+
+    def run_target(config):
+        if config.get("backend") != "llama_cpp":
+            return {"backend": config.get("backend")}
+        return {"backend": "llama_cpp",
+                "option": preset_option_id(config.get("llama_preset"), config.get("llama_kv_type")),
+                "preset": config.get("llama_preset"), "kv_type": config.get("llama_kv_type"),
+                "context_length": config.get("llama_context_length")}
+
+    def run_mark(c, operation_id, **milestones):
+        for name, at in milestones.items():
+            if operation_id and name in run_milestones:
+                c.execute(f"UPDATE runtime_runs SET {name}=COALESCE({name},?) "
+                          "WHERE operation_id=? AND ended_at IS NULL", (at, operation_id))
+
+    def run_end(c, operation_id, reason, error=None, runtime_seconds=None, at=None):
+        # An error recorded earlier (a failed model load) is the cause; what
+        # Kaggle reports once the run is over is kept only when nothing was.
+        if operation_id:
+            c.execute("UPDATE runtime_runs SET ended_at=?,end_reason=?,error=COALESCE(error,?),"
+                      "worker_runtime_seconds=COALESCE(?,worker_runtime_seconds) "
+                      "WHERE operation_id=? AND ended_at IS NULL",
+                      (at or time.time(), reason, redact(error)[:500] if error else None,
+                       runtime_seconds, operation_id))
+
+    def shutdown_just_done(item, now):
+        # A finished shutdown and the worker's last heartbeat are about a second
+        # apart. Queueing another shutdown in that gap only leaves a failed
+        # command behind; after a minute a worker that is still up gets a new one.
+        done_at = item.get("shutdown_done_at")
+        return bool(done_at and now - done_at < 60)
+
+    def admin_settings(config):
+        """Settings as the admin page gets them, with the dropdown option they stand for."""
+        return {**config, "llama_preset_option": preset_option_id(config.get("llama_preset"),
+                                                                  config.get("llama_kv_type"))}
+
+    def period_start(period):
+        """Start of a history period in Hong Kong time; None means everything."""
+        now_hk = datetime.now(timezone(timedelta(hours=8)))
+        if period == "today":
+            return now_hk.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        if period == "7d":
+            return (now_hk - timedelta(days=7)).timestamp()
+        if period == "30d":
+            return (now_hk - timedelta(days=30)).timestamp()
+        return None
 
     def runtime_session_maybe_live(item):
         return (item.get("state") in ("ready", "model_stopped", "model_switch_required", "failed")
@@ -903,8 +1083,14 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             c.execute("UPDATE runtime_state SET operation_id=?,state='queued_local',requested_by=?,requested_at=?,"
                       "updated_at=?,kernel_status=NULL,last_checked_at=NULL,stop_requested=0,error=NULL,"
                       "bootstrap_hash=NULL,bootstrap_expires_at=NULL,bootstrap_used_at=NULL,"
-                      "worker_session_hash=NULL,worker_session_expires_at=NULL WHERE id=1",
+                      "worker_session_hash=NULL,worker_session_expires_at=NULL,shutdown_done_at=NULL WHERE id=1",
                       (operation_id, requested_by, now, now))
+            # A row still open here missed its ending (for example a restart).
+            c.execute("UPDATE runtime_runs SET ended_at=?,end_reason='superseded' WHERE ended_at IS NULL", (now,))
+            c.execute("INSERT INTO runtime_runs(operation_id,requested_by,requested_at,target) VALUES(?,?,?,?)",
+                      (operation_id, requested_by, now, json.dumps(run_target(config), ensure_ascii=False)))
+            c.execute("DELETE FROM runtime_runs WHERE operation_id NOT IN "
+                      "(SELECT operation_id FROM runtime_runs ORDER BY requested_at DESC LIMIT 500)")
             log(c, "已创建 Kaggle 一键启动操作：" + operation_id[:8])
             snapshot = runtime_snapshot(c)
         runtime_wake.set()
@@ -921,25 +1107,29 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                 c.execute("UPDATE runtime_state SET state='stopped',stop_requested=0,error=NULL,updated_at=?,"
                           "bootstrap_hash=NULL,bootstrap_expires_at=NULL,bootstrap_used_at=NULL,"
                           "worker_session_hash=NULL,worker_session_expires_at=NULL WHERE id=1", (now,))
+                run_end(c, item.get("operation_id"), "cancelled_before_submit", at=now)
                 log(c, "已取消尚未提交的 Kaggle 启动操作")
                 return runtime_snapshot(c), 200
             if online(worker):
                 cancel_pending_before_shutdown(c, worker["worker_id"])
-                if not has_command(c, "shutdown"):
+                if not has_command(c, "shutdown") and not shutdown_just_done(item, now):
                     add_job(c, "command", {"action": "shutdown", "settings": settings(c)}, worker["worker_id"])
                 c.execute("UPDATE runtime_state SET state='stopping',requested_by=?,stop_requested=1,updated_at=? WHERE id=1",
                           (requested_by, now))
+                run_mark(c, item.get("operation_id"), stop_requested_at=now)
                 log(c, "已请求结束一键启动的 Worker")
                 return runtime_snapshot(c), 202
             if item.get("state") in runtime_active or runtime_session_maybe_live(item):
                 c.execute("UPDATE runtime_state SET state='stop_requested',requested_by=?,stop_requested=1,updated_at=? WHERE id=1",
                           (requested_by, now))
+                run_mark(c, item.get("operation_id"), stop_requested_at=now)
                 log(c, "启动过程中收到停止请求；Kaggle 无硬取消接口")
                 runtime_wake.set()
                 return runtime_snapshot(c), 202
             c.execute("UPDATE runtime_state SET state='stopped',stop_requested=0,updated_at=?,"
                       "bootstrap_hash=NULL,bootstrap_expires_at=NULL,bootstrap_used_at=NULL,"
                       "worker_session_hash=NULL,worker_session_expires_at=NULL WHERE id=1", (now,))
+            run_end(c, item.get("operation_id"), "stopped", at=now)
             return runtime_snapshot(c), 200
 
     def reconcile_runtime():
@@ -971,9 +1161,11 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                 kaggle_runtime.push(public_url, source, operation_id=operation_id,
                                     bootstrap_token=bootstrap_token)
                 with db() as c:
+                    submitted_at = time.time()
                     c.execute("UPDATE runtime_state SET state='waiting_worker',kernel_status='submitted',"
                               "updated_at=?,error=NULL WHERE id=1 AND operation_id=?",
-                              (time.time(), operation_id))
+                              (submitted_at, operation_id))
+                    run_mark(c, operation_id, submitted_at=submitted_at)
                     log(c, "Kaggle 已接收 Runtime Notebook，等待 Worker 连接")
             except KaggleRuntimeError as exc:
                 with db() as c:
@@ -985,6 +1177,7 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                               (state, redact(exc.message), time.time(), state, operation_id))
                     if not exc.uncertain:
                         clear_runtime_auth(c, operation_id)
+                        run_end(c, operation_id, "submit_failed", error=exc.message)
                     log(c, exc.message, "warning" if exc.uncertain else "error")
             finally:
                 bootstrap_token = None
@@ -1002,9 +1195,10 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                 return
             if item.get("stop_requested"):
                 if online(worker):
-                    cancel_pending_before_shutdown(c, worker["worker_id"])
-                    if not has_command(c, "shutdown"):
-                        add_job(c, "command", {"action": "shutdown", "settings": settings(c)}, worker["worker_id"])
+                    if not shutdown_just_done(item, now):
+                        cancel_pending_before_shutdown(c, worker["worker_id"])
+                        if not has_command(c, "shutdown"):
+                            add_job(c, "command", {"action": "shutdown", "settings": settings(c)}, worker["worker_id"])
                     c.execute("UPDATE runtime_state SET state='stopping',updated_at=? WHERE id=1", (now,))
                     return
             elif online(worker) and item.get("state") in ("failed", "model_stopped", "model_switch_required"):
@@ -1073,11 +1267,19 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                     state, error = "stopped", None
                 elif item.get("state") == "failed":
                     state, error = "failed", item.get("error") or failure or "Kaggle Notebook 运行失败后结束"
+                elif official_status == "cancelled":
+                    state, error = "failed", failure or "Kaggle 运行在 Worker 连接前被取消，可以重新启动"
                 else:
                     state, error = "failed", failure or "Kaggle Notebook 已结束，但 Worker 未成功连接"
             elif official_status == "error":
                 if item.get("stop_requested"):
                     state, error = "stopped", failure or "Kaggle Notebook 在停止过程中结束"
+                elif (item.get("state") == "waiting_worker" and not item.get("bootstrap_hash")
+                      and not item.get("worker_session_hash")):
+                    # Never registered and the unused bootstrap was already swept.
+                    state, error = "failed", (
+                        "Kaggle 排队超过一次性登记凭据有效期（%d 小时），Worker 登记被拒；请重新启动"
+                        % (RUNTIME_BOOTSTRAP_TTL // 3600))
                 else:
                     state, error = "failed", failure or "Kaggle Notebook 运行失败"
             else:
@@ -1085,8 +1287,14 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             c.execute("UPDATE runtime_state SET state=?,kernel_status=?,error=?,updated_at=?,"
                       "stop_requested=CASE WHEN ?='stopped' THEN 0 ELSE stop_requested END WHERE id=1",
                       (state, official_status, error, now, state))
+            if official_status == "running":
+                run_mark(c, checked_operation, running_at=now)
             if official_status in ("complete", "cancelled", "error"):
                 clear_runtime_auth(c, checked_operation)
+                # Reached only when the worker's own last heartbeat never
+                # arrived; otherwise that heartbeat has closed the row already.
+                run_end(c, checked_operation, "kaggle_" + official_status,
+                        error=error if state == "failed" else None, at=now)
 
     def runtime_loop():
         while not runtime_stop.is_set():
@@ -1269,7 +1477,8 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             agent = current_worker(c)
             runtime = runtime_snapshot(c)
         memory = psutil.virtual_memory()
-        return {"agent": agent, "settings": config, "runtime": runtime, "recent_jobs": jobs,
+        return {"agent": agent, "settings": admin_settings(config), "presets": LLAMA_PRESET_OPTIONS,
+                "runtime": runtime, "recent_jobs": jobs,
                 "api_endpoint": config["public_url"] + "/v1" if config["public_url"] else "",
                 "server": {"hostname": socket.gethostname(), "architecture": platform.machine(), "uptime_seconds": time.time() - start,
                            "version": VERSION, "timezone": "Asia/Hong_Kong", "ram_used_mb": memory.used / 1048576,
@@ -1278,18 +1487,32 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
     @api.get("/api/settings", dependencies=[Depends(admin)])
     def get_settings():
         with db() as c:
-            return {"settings": settings(c)}
+            return {"settings": admin_settings(settings(c))}
 
     @api.put("/api/settings", dependencies=[Depends(admin)])
     def put_settings(body: Settings):
         patch = body.model_dump(exclude_none=True)
+        option = LLAMA_PRESET_OPTION_BY_ID.get(patch.pop("llama_preset_option", None))
+        if option:
+            # The option decides the preset and, for the fast presets, the KV
+            # type; everything else it fills only where the request is silent.
+            pinned_kv = option["fill"]["llama_kv_type"] if option["kv_pinned"] else None
+            if body.llama_preset not in (None, option["preset"]):
+                raise HTTPException(422, "模型预设与所选预设选项不一致")
+            if pinned_kv and body.llama_kv_type not in (None, pinned_kv):
+                raise HTTPException(422, f"“{option['detail']}”选项固定使用 {pinned_kv} KV；"
+                                         "要换 KV 类型请改选对应的预设选项")
+            patch = {**option["fill"], **patch}
         with db() as c:
             config = settings(c)
             old_backend = config.get("backend", "llama_cpp")
             old_preset = config.get("llama_preset", "qwen38_27b")
+            old_option = preset_option_id(old_preset, config.get("llama_kv_type"))
             new_backend = patch.get("backend", old_backend)
             new_preset = patch.get("llama_preset", old_preset)
-            if new_preset != old_preset:
+            if new_preset != old_preset and not option:
+                # No option was named (an older page or a direct API call), so
+                # work out which fields the caller left at the old defaults.
                 old_defaults = LLAMA_PRESET_DEFAULTS[old_preset]
                 new_defaults = LLAMA_PRESET_DEFAULTS[new_preset]
                 for field, target in new_defaults.items():
@@ -1297,6 +1520,16 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                     if (incoming == config.get(field)
                             and config.get(field) in (old_defaults.get(field), DEFAULT_SETTINGS.get(field))):
                         patch[field] = target
+                # The form resends the saved KV type, which the loop above reads
+                # as untouched. Keep it when it was chosen on the other fast
+                # preset, or when the window being saved only fits with it.
+                limits = QWEN_FAST_MAX_CONTEXT.get(new_preset)
+                wanted_kv = body.llama_kv_type or config.get("llama_kv_type")
+                if limits and wanted_kv in limits:
+                    context = patch.get("llama_context_length", config.get("llama_context_length"))
+                    if old_preset in QWEN_FAST_MAX_CONTEXT or context > limits[patch.get("llama_kv_type", wanted_kv)]:
+                        patch["llama_kv_type"] = wanted_kv
+            if new_preset != old_preset:
                 # A manually pinned model/projector path belongs to the old
                 # preset. Switching always returns to exact fixed discovery.
                 patch["llama_model_path"] = ""
@@ -1304,11 +1537,25 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             config.update(patch)
             if config.get("llama_preset") == "qwen38_27b_mtp" and config.get("llama_mmproj_path"):
                 raise HTTPException(422, "Qwen MTP 纯文本预设不加载视觉投影；请使用 Qwen MTP 视觉或稳定 Qwen 预设")
+            if config.get("llama_preset") == "qwen38_27b_fast" and config.get("llama_mmproj_path"):
+                raise HTTPException(422, "Qwen 高速纯文本预设不加载视觉投影；请使用 Qwen 高速视觉预设")
+            fast_limits = QWEN_FAST_MAX_CONTEXT.get(config.get("llama_preset"))
+            if fast_limits:
+                kv_type = config["llama_kv_type"]
+                if kv_type not in fast_limits:
+                    raise HTTPException(422, "该高速预设只实测过 %s KV" % " / ".join(sorted(fast_limits)))
+                if config["llama_context_length"] > fast_limits[kv_type]:
+                    widest = max(fast_limits, key=fast_limits.get)
+                    hint = ("；改用 %s KV 可到 %d" % (widest, fast_limits[widest])
+                            if fast_limits[widest] >= config["llama_context_length"] else "")
+                    raise HTTPException(422, f"该高速预设在双 T4 上用 {kv_type} KV 实测最多 "
+                                             f"{fast_limits[kv_type]} tokens 上下文{hint}")
             effective_batch = config["llama_batch_size"] or (256 if config["llama_context_length"] <= 131072 else 128)
             if config["llama_ubatch_size"] > effective_batch:
                 raise HTTPException(422, "ubatch 不能大于 batch")
             c.execute("UPDATE settings SET value=? WHERE id=1", (json.dumps(config),))
-            target_changed = new_backend != old_backend or new_preset != old_preset
+            new_option = preset_option_id(config["llama_preset"], config["llama_kv_type"])
+            target_changed = new_backend != old_backend or new_option != old_option
             worker = current_worker(c)
             runtime = runtime_row(c)
             if (target_changed and ready(worker) and not has_model_command(c)
@@ -1317,8 +1564,8 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                 state = "ready" if model_matches_config(worker, config) else "model_switch_required"
                 c.execute("UPDATE runtime_state SET state=?,kernel_status='running',error=NULL,updated_at=? WHERE id=1",
                           (state, time.time()))
-            log(c, "管理配置已更新" + ("；目标模型预设已切换为 " + new_preset if new_preset != old_preset else ""))
-        return {"settings": config}
+            log(c, "管理配置已更新" + ("；目标模型预设已切换为 " + new_option if new_option != old_option else ""))
+        return {"settings": admin_settings(config)}
 
     @api.get("/api/keys", dependencies=[Depends(admin)])
     def keys():
@@ -1358,14 +1605,7 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                         limit: int = Query(default=100, ge=1, le=500)):
         if status and status not in ("pending", "running", *TERMINAL):
             raise HTTPException(422, "请求状态筛选无效")
-        now_hk = datetime.now(timezone(timedelta(hours=8)))
-        since = None
-        if period == "today":
-            since = now_hk.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-        elif period == "7d":
-            since = (now_hk - timedelta(days=7)).timestamp()
-        elif period == "30d":
-            since = (now_hk - timedelta(days=30)).timestamp()
+        since = period_start(period)
         clauses, params = [], []
         if since is not None:
             clauses.append("created_at>=?")
@@ -1469,6 +1709,110 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
         payload, status_code = stop_runtime("admin")
         headers = {"Retry-After": "5"} if status_code == 202 else None
         return JSONResponse(payload, status_code=status_code, headers=headers)
+
+    @api.get("/api/runtime/runs", dependencies=[Depends(admin)])
+    def runtime_run_history(period: Literal["today", "7d", "30d", "all"] = "30d",
+                            limit: int = Query(default=100, ge=1, le=500)):
+        """Per-launch timings: Kaggle queue, model load, session length and how it ended."""
+        since = period_start(period)
+        now = time.time()
+        with db() as c:
+            # At most 500 rows are kept. All are read because "relaunched soon
+            # after an idle stop" needs the launch before the period too.
+            history = [dict(row) for row in c.execute("SELECT * FROM runtime_runs ORDER BY requested_at")]
+            key_names = {row["id"]: row["name"] for row in c.execute("SELECT id,name FROM keys")}
+
+        def span(start_at, end_at):
+            if start_at is None or end_at is None or end_at < start_at:
+                return None
+            return round(end_at - start_at, 1)
+
+        def stored_json(value):
+            try:
+                loaded = json.loads(value) if value else None
+            except (json.JSONDecodeError, TypeError):
+                return None
+            return loaded if isinstance(loaded, dict) else None
+
+        items = []
+        previous = None
+        for row in history:
+            ended_at = row["ended_at"]
+            if ended_at is not None:
+                phase, phase_start = "ended", None
+            elif row["ready_at"] is not None:
+                phase, phase_start = "ready", row["ready_at"]
+            elif row["worker_at"] is not None:
+                phase, phase_start = "loading", row["worker_at"]
+            elif row["submitted_at"] is not None:
+                phase, phase_start = "queued", row["submitted_at"]
+            else:
+                phase, phase_start = "submitting", row["requested_at"]
+            requested_by = row["requested_by"] or ""
+            if requested_by.startswith("api:"):
+                requester = {"kind": "api", "name": key_names.get(requested_by[4:]) or "已删除的 API Key"}
+            else:
+                requester = {"kind": "admin", "name": "管理站"}
+            session_seconds = row["worker_runtime_seconds"]
+            if session_seconds is None:
+                session_seconds = span(row["worker_at"], ended_at if ended_at is not None else now)
+            # How soon this launch followed an idle stop: the evidence for
+            # whether the idle limit is too short.
+            after_idle = None
+            if previous and previous["end_reason"] == "idle" and previous["ended_at"] is not None:
+                gap = row["requested_at"] - previous["ended_at"]
+                if 0 <= gap <= 1800:
+                    after_idle = round(gap)
+            previous = row
+            if since is not None and row["requested_at"] < since:
+                continue
+            items.append({
+                "operation_id": row["operation_id"][:8], "requester": requester,
+                "target": stored_json(row["target"]) or {}, "model": stored_json(row["model"]),
+                "phase": phase, "phase_seconds": span(phase_start, now),
+                "requested_at": row["requested_at"], "submitted_at": row["submitted_at"],
+                "running_at": row["running_at"], "worker_at": row["worker_at"], "ready_at": row["ready_at"],
+                "stop_requested_at": row["stop_requested_at"], "ended_at": ended_at,
+                "submit_seconds": span(row["requested_at"], row["submitted_at"]),
+                "queue_seconds": span(row["submitted_at"], row["worker_at"]),
+                "load_seconds": span(row["worker_at"], row["ready_at"]),
+                "ready_seconds": span(row["requested_at"], row["ready_at"]),
+                "session_seconds": round(session_seconds, 1) if session_seconds is not None else None,
+                "total_seconds": span(row["requested_at"], ended_at if ended_at is not None else now),
+                "end_reason": row["end_reason"], "error": row["error"],
+                "after_idle_seconds": after_idle,
+            })
+        items.reverse()
+
+        def values(field):
+            return [item[field] for item in items if item[field] is not None]
+
+        def middle(field):
+            found = values(field)
+            return round(median(found), 1) if found else None
+
+        def longest(field):
+            found = values(field)
+            return max(found) if found else None
+
+        reasons: dict[str, int] = {}
+        for item in items:
+            if item["end_reason"]:
+                reasons[item["end_reason"]] = reasons.get(item["end_reason"], 0) + 1
+        summary = {
+            "launches": len(items),
+            "ready": len(values("ready_seconds")),
+            "not_ready": sum(1 for item in items if item["phase"] == "ended" and item["ready_at"] is None),
+            "in_progress": sum(1 for item in items if item["phase"] != "ended"),
+            "queue_median_seconds": middle("queue_seconds"), "queue_max_seconds": longest("queue_seconds"),
+            "load_median_seconds": middle("load_seconds"), "load_max_seconds": longest("load_seconds"),
+            "ready_median_seconds": middle("ready_seconds"), "ready_max_seconds": longest("ready_seconds"),
+            "session_total_seconds": round(sum(values("session_seconds")), 1),
+            "end_reasons": reasons,
+            "idle_stops": reasons.get("idle", 0),
+            "idle_relaunches": len(values("after_idle_seconds")),
+        }
+        return {"period": period, "now": now, "summary": summary, "rows": items[:limit]}
 
     @api.get("/v1/runtime/status")
     def public_runtime_status(api_key: dict = Depends(api_auth)):
@@ -1623,12 +1967,15 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                       "WHERE id=1 AND operation_id=?",
                       (now, session_hash, session_expires, now, body.operation_id))
             if first_use:
+                run_mark(c, body.operation_id, worker_at=now)
                 log(c, "Runtime Worker 已使用一次性凭据完成登记")
         return {"worker_session_token": session_token, "expires_at": session_expires}
 
-    @api.post("/worker/heartbeat", dependencies=[Depends(worker_auth)])
-    def heartbeat(body: Heartbeat):
+    @api.post("/worker/heartbeat")
+    def heartbeat(body: Heartbeat, auth: dict = Depends(worker_auth)):
         now = time.time()
+        # Only a worker holding this launch's session token writes its history.
+        run_id = auth.get("operation_id") if auth.get("kind") == "runtime" else None
         with db() as c:
             c.execute("BEGIN IMMEDIATE")
             sweep(c)
@@ -1655,16 +2002,26 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             config = settings(c)
             model_status = (body.model or {}).get("status")
             runtime = runtime_row(c)
+            if run_id and model_status == "ready":
+                loaded = {key: body.model[key] for key in ("name", "preset", "context", "kv_type", "vision")
+                          if body.model.get(key) is not None}
+                # Reaching ready settles the launch; an earlier failed attempt no longer describes it.
+                c.execute("UPDATE runtime_runs SET ready_at=?,model=?,error=NULL "
+                          "WHERE operation_id=? AND ended_at IS NULL AND ready_at IS NULL",
+                          (now, json.dumps(loaded, ensure_ascii=False), run_id))
             if body.status in ("offline", "stopped"):
                 c.execute("UPDATE runtime_state SET state='stopped',stop_requested=0,kernel_status='complete',updated_at=?,"
                           "bootstrap_hash=NULL,bootstrap_expires_at=NULL,bootstrap_used_at=NULL,"
-                          "worker_session_hash=NULL,worker_session_expires_at=NULL WHERE id=1", (now,))
+                          "worker_session_hash=NULL,worker_session_expires_at=NULL,shutdown_done_at=NULL WHERE id=1", (now,))
+                run_end(c, run_id, body.stop_reason or "worker_stopped",
+                        runtime_seconds=body.runtime_seconds, at=now)
             elif runtime.get("stop_requested"):
-                cancel_pending_before_shutdown(c, body.worker_id)
-                if not has_command(c, "shutdown"):
-                    add_job(c, "command", {"action": "shutdown", "settings": config}, body.worker_id)
+                if not shutdown_just_done(runtime, now):
+                    cancel_pending_before_shutdown(c, body.worker_id)
+                    if not has_command(c, "shutdown"):
+                        add_job(c, "command", {"action": "shutdown", "settings": config}, body.worker_id)
+                        log(c, "Worker 已连接，按先前停止请求立即结束")
                 c.execute("UPDATE runtime_state SET state='stopping',kernel_status='running',updated_at=? WHERE id=1", (now,))
-                log(c, "Worker 已连接，按先前停止请求立即结束")
             elif runtime.get("state") == "model_stopped":
                 pass
             elif model_status == "ready":
@@ -1796,6 +2153,11 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                 if final_status != "completed":
                     c.execute("UPDATE runtime_state SET state='failed',error=?,updated_at=? WHERE id=1",
                               (error or "模型加载失败", completed_at))
+                    # Keep why a launch never became ready; the row stays open
+                    # until the worker itself ends.
+                    c.execute("UPDATE runtime_runs SET error=? WHERE ended_at IS NULL AND ready_at IS NULL "
+                              "AND operation_id=(SELECT operation_id FROM runtime_state WHERE id=1)",
+                              ((error or "模型加载失败")[:500],))
                 else:
                     c.execute("UPDATE runtime_state SET state='verifying_model',error=NULL,updated_at=? WHERE id=1",
                               (completed_at,))
@@ -1803,6 +2165,9 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                   and final_status == "completed"):
                 c.execute("UPDATE runtime_state SET state='model_stopped',error=NULL,updated_at=? WHERE id=1",
                           (completed_at,))
+            elif (row["type"] == "command" and job_payload.get("action") == "shutdown"
+                  and final_status == "completed"):
+                c.execute("UPDATE runtime_state SET shutdown_done_at=? WHERE id=1", (completed_at,))
             labels = {"completed": "完成", "cancelled": "取消", "failed": "失败"}
             log(c, "任务" + labels[final_status] + "：" + job_id[:8], "info" if final_status == "completed" else "warning" if final_status == "cancelled" else "error")
         return {"ok": True}

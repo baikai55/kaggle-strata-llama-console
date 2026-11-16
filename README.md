@@ -19,7 +19,7 @@
 4. 日常先在管理面板选择已保存的 llama.cpp 模型预设，再点击“一键启动算力”。网站通过 Kaggle 官方接口提交专用 Commit Run，以一次性 bootstrap 凭据换取本次运行的临时 Worker 会话凭据；Worker 上线后自动加载所选模型。手动下载并运行接入 Notebook 仍可作为调试或回退方式。
 5. 在“对话测试”验证回答，之后在“API 访问”创建客户端 Key；只有显式勾选“允许唤醒算力”的 Key 才能调用 Wake API。普通聊天 Key 默认没有唤醒权限。
 6. 如需在管理站查看官方配额，继续使用同一个服务端 `KAGGLE_API_TOKEN`。Token 不在网页录入，也不会返回浏览器。
-7. 用完在管理站停止 Worker。若 Kaggle 运行已经提交，官方接口不能立即硬取消；网站会记录停止请求，Worker 上线后立即退出，Commit Run 随后自然结束。仍应在 Kaggle 页面和配额页确认 GPU 已释放。
+7. 用完在管理站停止 Worker；忘了停也会在连续空闲 8 分钟后自动结束。若 Kaggle 运行已经提交，官方接口不能立即硬取消；网站会记录停止请求，Worker 上线后立即退出，Commit Run 随后自然结束。仍应在 Kaggle 页面和配额页确认 GPU 已释放。
 
 ## 一键启动与 Wake API
 
@@ -28,7 +28,7 @@
 - 普通 `/v1/chat/completions` 和 `/v1/models` 不会隐式启动 GPU，也不会保存并重放离线请求。模型未就绪时仍返回明确的不可用错误。
 - 启动操作幂等，并有 60 秒冷却；重复点击或多个 Wake 请求不会重复提交同一次运行。提交超时时结果视为不确定，只查询 Kaggle 官方状态，不自动再次 push。
 - 启动会开启 `auto_load`；Worker 已在线时只排队加载模型，不提交新的 Kaggle 运行。停止请求优先于自动加载。
-- Kaggle 官方 CLI Push 不能表达或继承网页中勾选的 Secret 授权，因此一键启动不把长期 `STRATA_WORKER_KEY` 写入 Runtime Notebook。控制器为每个 operation 生成约 20 分钟有效的一次性 bootstrap；首次兑换后只保留约 60 秒幂等重试窗，并换取约 3 小时加 10 分钟停止宽限的临时 Worker 会话。SQLite 只保存这些凭据的 SHA-256 与期限。
+- Kaggle 官方 CLI Push 不能表达或继承网页中勾选的 Secret 授权，因此一键启动不把长期 `STRATA_WORKER_KEY` 写入 Runtime Notebook。控制器为每个 operation 生成最长 12 小时有效（覆盖 Kaggle GPU 排队）的一次性 bootstrap；首次兑换后只保留约 60 秒幂等重试窗，并换取约 3 小时加 10 分钟停止宽限的临时 Worker 会话。SQLite 只保存这些凭据的 SHA-256 与期限。
 - `0.4.1` 已完成真实 Commit Run 验收：临时 bootstrap 登记、自动加载、短答、工具调用、停止和 GPU 释放均通过。当前 128K 配置保存为 batch/ubatch `1024/256`；4,034-token 未缓存提示约 501 tok/s，192-token 解码约 13.9 tok/s。
 - `0.5.0` 已完成真实流式验收：`llama.cpp → Worker → Cloudflare → CPA` 会持续转发 OpenAI SSE，客户端断开会取消当前推理但保留已加载模型；208.6 秒 CPA 长流完整结束，不再出现原约 125 秒的 499。
 - `0.6.0` 已为同一 Qwen3.8 llama.cpp 链路加载固定 `mmproj-F16.gguf` 并完成真实识图验收：Worker 心跳报告 `vision=true`，64×64 左红右蓝 PNG 经公开 API 返回“左红右蓝”。
@@ -37,6 +37,10 @@
 - `0.7.2` 修复慢控制面往返触发“每个 token 单独上传一次”的流式反馈循环；请求监控分别展示 llama.cpp 模型 decode 与端到端交付速度。手动 Worker 空闲退出改为 8 分钟，并增加固定 Ornith 视觉预设。正式视觉进程已实测 400-token 文本 decode 67.11 tok/s，固定左红右蓝 PNG 识别正确。
 - `0.8.0` 增加独立 `qwen38_27b_mtp` 纯文本实验预设：复用主 GGUF 内置 NextN/MTP 张量，以 `draft-mtp`、`n-max=2` 起步，不下载独立 draft sidecar。稳定 Qwen 预设继续负责识图，便于同一 Runtime 内 A/B 与即时回退。
 - `0.8.1` 增加隔离的 `qwen38_27b_mtp_vision` 实验预设，同时加载固定 mmproj 与内嵌 MTP。n=4 真机识图正确且进程稳定，但 400-token 长输出仅 18.06 tok/s、接受率 48.9%，没有优于 n=2，因此最终视觉 MTP 预设也固定为 n=2。
+- `0.9.4` 两个高速预设开放 Q8 KV：F16 仍是默认（纯文本上限 184,320、视觉 147,456），选 Q8_0 后两者上下文都可到 204,800。实测 Q8 在短上下文与 F16 同速（约 30–33 tok/s），上下文越深越慢（15 万 token 处约 14–16 对 21 tok/s）。下面 `0.9.0` 条目里“KV 固定 F16、200K 无法分配”只对 F16 成立。
+- `0.9.5` 托管 Runtime 恢复空闲自动停止：`0.7.1` 起一键启动的 Runtime 把空闲上限放宽到 3 小时，没人用时也会一直占着 GPU 到上限；现在与手动 Worker 一样连续空闲 8 分钟即结束，Worker 退出时把原因写进运行日志。
+- `0.9.6` 模型预设下拉增加“高速 / 纯文本 200K”“高速 / 视觉 200K”两个选项，选中后自动填入实测过的上下文、KV 精度、Batch 与双卡切分（共 9 个选项，136K/176K 与 200K 之间可一键切换）；新增“启动统计”页，记录每次一键启动的排队、加载、点击到就绪、会话时长和结束原因（从 0.9.6 起记录，保留最近 500 次）；界面改为浅色主题。同时修复手动停止后多排一条 `shutdown`，以及 Worker 上传流式批次遇到瞬时 5xx 不重试导致请求失败的问题。
+- `0.9.0` 增加 `qwen38_27b_fast`（纯文本，默认 176K、上限 184,320）与 `qwen38_27b_fast_vision`（视觉，默认 136K、上限 147,456）两个高速预设：`--split-mode tensor` 叠加内嵌 MTP n=2 与 `ngram-mod`，KV 固定 F16。双 T4 基准中推理/代码类输出 33–36.6 tok/s、改写类约 100 tok/s；200K 在 tensor 切分下无法分配，需要 200K 以上窗口时仍用 layer 切分 + Q8 KV 的 MTP 预设（约 21 tok/s）。同版修复 `llama-server` 本机 API 鉴权：密钥改由 `LLAMA_API_KEY` 传入，此前的 `LLAMA_ARG_API_KEY` 不被读取。
 
 ## 能力边界
 
@@ -49,7 +53,7 @@
 - 冷启动现场观测曾为约 4 分 22 秒；0.4.1 的一次真实 Commit Run 为约 8 分 22 秒，其中模型加载约 43 秒，其余主要是 Kaggle 排队/GPU/Input 准备。平台时延没有固定保证。
 - 管理站可以通过固定专用 Notebook 启动 Kaggle Commit Run，并在 Worker 上线后自动加载模型；它不能远程点击或硬停止交互式 Kaggle Draft Session，也不能硬取消已经提交的 Commit Run。
 - `llama.cpp` 已实时转发文本、reasoning、工具调用和 usage 分块；0.5.0 真机验收中同一条流保持稳定 `id/model`、role 仅出现一次，最后发送 `[DONE]`。Strata 兼容后端仍在推理完成后整包返回。
-- 模型调用和控制命令按队列执行，最长等待 30 分钟；客户端中途断开会取消当前 `llama.cpp` 推理并关闭其上游连接，但不会停止 `llama-server`。手动 Worker 默认空闲 8 分钟；用户从管理站启动的托管 Runtime 可保持到 3 小时总时长上限。
+- 模型调用和控制命令按队列执行，最长等待 30 分钟；客户端中途断开会取消当前 `llama.cpp` 推理并关闭其上游连接，但不会停止 `llama-server`。手动 Worker 与管理站启动的托管 Runtime 都在连续空闲 8 分钟（没有推理或模型操作；心跳和状态查询不算）后自动停止模型并结束会话，单次最长 3 小时。
 - 管理站与 OpenAI 兼容接口的默认最大输出为 32,768 tokens；输入、历史、工具结果和输出仍共同占用模型上下文。
 - 聊天测试页只展示模型工具调用，不执行外部工具。Agent 客户端负责执行工具和管理上下文。
 - “请求监控”展示来源、状态、排队、TTFT、模型 decode、流式交付速度和 token 用量等元数据，不保存提示词、回答正文或完整 API Key。

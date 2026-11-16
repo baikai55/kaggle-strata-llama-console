@@ -83,7 +83,8 @@ def build_runtime_notebook(server_url: str, worker_source: str, operation_id: st
             markdown("# Kaggle Strata Console Runtime\n\n"
                      "此私有 Notebook 由管理站通过 Kaggle 官方 API 提交运行。它只携带一次性、"
                      "短期且绑定本次启动操作的凭据；长期 `STRATA_WORKER_KEY` 不进入 Notebook。\n\n"
-                     "本次托管 Runtime 最长运行 3 小时；最后一个单元结束后，本次 Commit Run 自然完成。"),
+                     "本次托管 Runtime 连续空闲 8 分钟（没有推理或模型操作）即自动结束，最长运行 3 小时；"
+                     "最后一个单元结束后，本次 Commit Run 自然完成并释放 GPU。"),
             code("import base64, pathlib, platform, subprocess\n"
                  "if platform.system() != 'Linux':\n    raise RuntimeError('需要 Kaggle Linux Runtime')\n"
                  "subprocess.run(['nvidia-smi', '--query-gpu=index,name,memory.total', '--format=csv,noheader'], check=True)\n"
@@ -109,8 +110,9 @@ def build_runtime_notebook(server_url: str, worker_source: str, operation_id: st
                  "    raise RuntimeError('Runtime Worker 临时会话凭据无效')\n"
                  "RUNTIME_BOOTSTRAP_TOKEN = None\n"
                  "worker_namespace = runpy.run_path(str(WORKER_FILE), run_name='strata_console_runtime_worker')\n"
-                 "worker = worker_namespace['Worker'](SERVER_URL, worker_session_token, "
-                 "idle_timeout=worker_namespace['MAX_RUNTIME'])\n"
+                 # No idle override: the managed Runtime keeps the Worker's own
+                 # IDLE_TIMEOUT so an unused session ends and frees the GPU.
+                 "worker = worker_namespace['Worker'](SERVER_URL, worker_session_token)\n"
                  "worker_session_token = None\n"
                  "try:\n    worker.run()\nfinally:\n    worker.stop_event.set()\n    worker.stop_model()\n"),
         ],

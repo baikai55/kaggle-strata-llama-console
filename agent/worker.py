@@ -33,10 +33,34 @@ LLAMA_KV_TYPES = {"q8_0", "f16"}
 DEFAULT_LLAMA_PRESET = "qwen38_27b"
 QWEN_MTP_PRESET = "qwen38_27b_mtp"
 QWEN_MTP_VISION_PRESET = "qwen38_27b_mtp_vision"
+QWEN_FAST_PRESET = "qwen38_27b_fast"
+QWEN_FAST_VISION_PRESET = "qwen38_27b_fast_vision"
+QWEN_FAST_PRESETS = frozenset({QWEN_FAST_PRESET, QWEN_FAST_VISION_PRESET})
 ORNITH_TEXT_PRESET = "ornith_35b_a3b"
 ORNITH_VISION_PRESET = "ornith_35b_a3b_vision"
 LLAMA_PRESETS = frozenset({DEFAULT_LLAMA_PRESET, QWEN_MTP_PRESET, QWEN_MTP_VISION_PRESET,
-                           ORNITH_TEXT_PRESET, ORNITH_VISION_PRESET})
+                           *QWEN_FAST_PRESETS, ORNITH_TEXT_PRESET, ORNITH_VISION_PRESET})
+# Measured on dual T4 with tensor split (2026-11-14/15). f16 KV fits 184,320
+# tokens with about 860 MiB spare per card and fails to allocate at 204,800.
+# Q8 KV is about half the size: 204,800 loads at 12,903 MiB per card. A cold
+# first run decodes as fast as f16 (about 33 tok/s); the cost shows deep in
+# the window, about 23 against 26 at 24K tokens and 15 against 21 at 150K.
+# f16 therefore stays the default and q8_0 is the way to 200K.
+# llama.cpp's multi-GPU doc still calls quantized KV unsupported with tensor
+# split; the pinned build runs it, and both needle tests passed.
+QWEN_FAST_CONTEXT = 176 * 1024
+QWEN_FAST_MAX_CONTEXT = {"f16": 184320, "q8_0": 204800}
+# The GPU-hosted projector needs its own VRAM. With a 2048px image (4,122
+# tokens, the projector's cap) 147,456 peaks at 14,795 MiB on GPU 0, while
+# 155,648 fails to allocate the encoder graph. A CPU-hosted projector keeps
+# the full window but took 47 s for one 1024px image, so it is not offered.
+QWEN_FAST_VISION_CONTEXT = 136 * 1024
+# With Q8 KV the projector fits beside a 204,800 window: the same 2048px
+# image peaks at 14,545 MiB and a 150K-token needle test passed.
+QWEN_FAST_VISION_MAX_CONTEXT = {"f16": 144 * 1024, "q8_0": 204800}
+# ngram-mod drafts from text already in the context, so copy-heavy output
+# (rewrites, edits, quoted code) decodes several times faster.
+QWEN_FAST_NGRAM = {"--spec-ngram-mod-n-match": 16, "--spec-ngram-mod-n-min": 12, "--spec-ngram-mod-n-max": 32}
 LLAMA_DATASET_ROOTS = (
     Path("/kaggle/input/datasets/job579/qwen3-8-27b-unsloth-q4-runtime"),
     Path("/kaggle/input/qwen3-8-27b-unsloth-q4-runtime"),
@@ -60,6 +84,8 @@ ORNITH_MMPROJ_NAME = "mmproj-Ornith-1.5-35B-BF16.gguf"
 ORNITH_MMPROJ_BYTES = 902_822_240
 ORNITH_MMPROJ_SHA256 = "1921a36a85aee56cd2abd27f46701802c9d85a33474792e600df6c3b282a135d"
 MAX_RUNTIME = 3 * 60 * 60
+# Applies to manual notebooks and the one-click managed Runtime alike: a Kaggle
+# session that is not serving jobs still burns the weekly GPU quota.
 IDLE_TIMEOUT = 8 * 60
 MODEL_PORT = 18080
 MODEL_LOG_BYTES = 256 * 1024
@@ -69,6 +95,17 @@ RUNTIME_LIB_BYTES = 4 * 1024 ** 3
 STREAM_BATCH_CHUNKS = 32
 STREAM_BATCH_BYTES = 128 * 1024
 STREAM_BATCH_SECONDS = 0.2
+# Waits between attempts when the console, or the tunnel in front of it, drops
+# a request or answers 5xx. Chunk uploads and result reports are idempotent, so
+# the report is repeated and the inference never is.
+CONTROL_RETRY_PAUSES = (0.25, 0.5, 1, 2, 4)
+
+
+def describe_duration(seconds: float) -> str:
+    minutes = seconds / 60
+    if minutes >= 60 and minutes % 60 == 0:
+        return f"{minutes / 60:g} 小时"
+    return f"{minutes:g} 分钟"
 
 
 def _write_all(stream, data):
@@ -211,13 +248,18 @@ class JobCancelled(WorkerError):
     pass
 
 
+class ControlUnavailable(WorkerError):
+    """The console answered 5xx: a restart or a tunnel hiccup, worth another try."""
+
+
 def llama_preset_spec(settings: dict) -> tuple[str, dict]:
     """Resolve one fixed model preset; requests cannot add Dataset roots."""
     preset = settings.get("llama_preset") or DEFAULT_LLAMA_PRESET
     if preset not in LLAMA_PRESETS:
         raise WorkerError("不支持的 llama.cpp 模型预设")
-    if preset in (DEFAULT_LLAMA_PRESET, QWEN_MTP_PRESET, QWEN_MTP_VISION_PRESET):
-        is_mtp = preset in (QWEN_MTP_PRESET, QWEN_MTP_VISION_PRESET)
+    if preset in (DEFAULT_LLAMA_PRESET, QWEN_MTP_PRESET, QWEN_MTP_VISION_PRESET, *QWEN_FAST_PRESETS):
+        is_fast = preset in QWEN_FAST_PRESETS
+        is_mtp = is_fast or preset in (QWEN_MTP_PRESET, QWEN_MTP_VISION_PRESET)
         return preset, {
             "dataset_roots": LLAMA_DATASET_ROOTS,
             "dataset_slug": "job579/qwen3-8-27b-unsloth-q4-runtime",
@@ -234,13 +276,21 @@ def llama_preset_spec(settings: dict) -> tuple[str, dict]:
             # Keep both accelerated presets at n=2. The n=4 vision smoke was
             # stable, but its 400-token decode was slower because acceptance
             # fell below 50%; vision is therefore an orthogonal preset choice.
-            "default_vision": preset in (DEFAULT_LLAMA_PRESET, QWEN_MTP_VISION_PRESET),
+            "default_vision": preset in (DEFAULT_LLAMA_PRESET, QWEN_MTP_VISION_PRESET,
+                                         QWEN_FAST_VISION_PRESET),
             "alias": "qwen3.8-27b",
-            "context": 131072,
+            "context": (QWEN_FAST_VISION_CONTEXT if preset == QWEN_FAST_VISION_PRESET
+                        else QWEN_FAST_CONTEXT if is_fast else 131072),
+            # Tensor split keeps both T4s busy during decode (33-36 tok/s
+            # against 23 with layer split). max_context maps each measured KV
+            # type to its limit.
+            "split_mode": "tensor" if is_fast else "layer",
+            "max_context": (QWEN_FAST_VISION_MAX_CONTEXT if preset == QWEN_FAST_VISION_PRESET
+                            else QWEN_FAST_MAX_CONTEXT if is_fast else None),
             # The main GGUF already contains blk.64.nextn.* tensors. The
             # pinned llama.cpp can create an MTP context from the target model,
             # so this preset deliberately does not require an -md sidecar.
-            "spec_type": "draft-mtp" if is_mtp else None,
+            "spec_type": "draft-mtp,ngram-mod" if is_fast else "draft-mtp" if is_mtp else None,
             "spec_draft_n_max": 2 if is_mtp else None,
         }
     return preset, {
@@ -263,6 +313,8 @@ def llama_preset_spec(settings: dict) -> tuple[str, dict]:
         "default_vision": preset == ORNITH_VISION_PRESET,
         "alias": "ornith-1.5-35b-a3b",
         "context": 131072,
+        "split_mode": "layer",
+        "max_context": None,
         "spec_type": None,
         "spec_draft_n_max": None,
     }
@@ -624,6 +676,8 @@ def prepare_llama(settings: dict, work_dir: Path, model_key: str,
     mmproj_value = settings.get("llama_mmproj_path")
     if preset == QWEN_MTP_PRESET and mmproj_value:
         raise WorkerError("Qwen MTP 纯文本预设不加载视觉投影；请切换到 Qwen MTP 视觉或稳定 Qwen 预设")
+    if preset == QWEN_FAST_PRESET and mmproj_value:
+        raise WorkerError("Qwen 高速纯文本预设不加载视觉投影；请切换到 Qwen 高速视觉预设")
     mmproj = (locate(mmproj_value, "mmproj", "视觉投影 GGUF", model_roots, required=False)
               if mmproj_value or spec["default_vision"] else None)
     if mmproj is not None:
@@ -690,9 +744,16 @@ def prepare_llama(settings: dict, work_dir: Path, model_key: str,
                     or str(manifest.get("mmproj_source_commit", "")).lower() != spec["mmproj_source_commit"]):
                 raise WorkerError("llama.cpp Dataset 清单与视觉投影不匹配")
     context = number(settings.get("llama_context_length", spec["context"]), "上下文长度", 1024, 1048576)
-    kv = settings.get("llama_kv_type", "q8_0")
+    tensor_split = spec["split_mode"] == "tensor"
+    kv = settings.get("llama_kv_type") or ("f16" if tensor_split else "q8_0")
     if kv not in LLAMA_KV_TYPES:
         raise WorkerError("不支持的 KV 缓存精度")
+    if spec["max_context"]:
+        limit = spec["max_context"].get(kv)
+        if limit is None:
+            raise WorkerError("该高速预设只实测过 %s KV" % " / ".join(sorted(spec["max_context"])))
+        if context > limit:
+            raise WorkerError(f"该高速预设在双 T4 上用 {kv} KV 实测最多 {limit} tokens 上下文")
     # Verified pairs: 256/64 up to 128K, 128/32 at 256K. 0 means automatic.
     batch = number(settings.get("llama_batch_size") or (256 if context <= 131072 else 128), "batch", 1, 2048)
     ubatch = number(settings.get("llama_ubatch_size") or min(batch, 64 if context <= 131072 else 32), "ubatch", 1, 2048)
@@ -710,7 +771,8 @@ def prepare_llama(settings: dict, work_dir: Path, model_key: str,
     runtime = work_dir / "llama-runtime"
     runtime.mkdir(parents=True, exist_ok=True)
     server = runtime / "llama-server"
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("STRATA_", "LLAMA_ARG_"))}
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("STRATA_", "LLAMA_ARG_")) and k != "LLAMA_API_KEY"}
     if source != server.resolve():
         copy_if_changed(source, server)
         # A build with shared libraries keeps them next to the binary.
@@ -726,25 +788,34 @@ def prepare_llama(settings: dict, work_dir: Path, model_key: str,
     except OSError:
         pass
     # The key travels by environment, never on the command line.
-    # llama.cpp exposes CLI flags through LLAMA_ARG_* environment variables.
     # Keep the secret out of argv/process listings while requiring auth on the
-    # loopback API used by this worker.
-    env["LLAMA_ARG_API_KEY"] = model_key
+    # loopback API used by this worker. Unlike most flags, --api-key reads
+    # LLAMA_API_KEY (no _ARG_ infix); the 2026-11-14 dual-T4 benchmark showed
+    # LLAMA_ARG_API_KEY is ignored and leaves the API open.
+    env["LLAMA_API_KEY"] = model_key
     env["CUDA_VISIBLE_DEVICES"] = "0,1"
     cmd = [str(server), "--model", str(model), "--alias", alias,
-           "--n-gpu-layers", "999", "--split-mode", "layer", "--tensor-split", split,
+           "--n-gpu-layers", "999", "--split-mode", spec["split_mode"], "--tensor-split", split,
            "--main-gpu", "0",
            "--ctx-size", str(context), "--parallel", "1", "--batch-size", str(batch),
            "--ubatch-size", str(ubatch), "--flash-attn", "on", "--cache-type-k", kv,
            "--cache-type-v", kv, "--threads", "4", "--threads-batch", "4", "--jinja",
            "--host", "127.0.0.1", "--port", str(port), "--metrics"]
+    if tensor_split:
+        # Auto-fit is not supported with tensor split.
+        cmd.extend(["--fit", "off"])
     if spec["spec_type"]:
         cmd.extend(["--spec-type", spec["spec_type"],
                     "--spec-draft-n-max", str(spec["spec_draft_n_max"])])
+        if "ngram-mod" in spec["spec_type"]:
+            for flag, value in QWEN_FAST_NGRAM.items():
+                cmd.extend([flag, str(value)])
     if mmproj is not None:
         cmd.extend(["--mmproj", str(mmproj)])
     info = {"alias": alias, "context": context, "vision": mmproj is not None,
             "preset": preset}
+    if tensor_split:
+        info.update({"split_mode": "tensor", "kv_type": kv})
     if spec["spec_type"]:
         info.update({"speculative": spec["spec_type"],
                      "spec_draft_n_max": spec["spec_draft_n_max"]})
@@ -915,15 +986,16 @@ class Worker:
         self.worker_id = "kaggle-" + uuid.uuid4().hex
         self.work_dir = Path(work_dir)
         self.max_runtime = min(float(max_runtime), MAX_RUNTIME)
-        # Manual notebooks keep the conservative eight-minute default, while
-        # the one-click managed Runtime may explicitly stay up to MAX_RUNTIME
-        # when the user asks to keep the model online for follow-up testing.
+        # Idle means no chat or command job; heartbeats and status polls do
+        # not count. The clock restarts when a job starts and when it ends.
         self.idle_timeout = min(float(idle_timeout), MAX_RUNTIME)
         if min(self.max_runtime, self.idle_timeout) <= 0:
             raise WorkerError("会话时限必须为正数")
         self.started = time.monotonic()
         self.last_activity = self.started
         self.stop_event = threading.Event()
+        # Why the session is ending, for the launch history on the console.
+        self.stop_reason = None
         self.registered = threading.Event()
         self.process = None
         self.diagnostics = None
@@ -954,6 +1026,12 @@ class Worker:
             self.logs.append({"level": level, "message": message[:1200], "created_at": time.time()})
             self.logs = self.logs[-100:]
 
+    def stop(self, reason: str):
+        # The first reason is the cause; whatever follows is a consequence of it.
+        if self.stop_reason is None:
+            self.stop_reason = reason
+        self.stop_event.set()
+
     def session(self):
         s = requests.Session()
         s.trust_env = False
@@ -963,8 +1041,10 @@ class Worker:
     def request(self, session, method, path, **kwargs):
         response = session.request(method, self.server_url + path, timeout=(3, 5), allow_redirects=False, **kwargs)
         if response.status_code in (401, 403, 409):
-            self.stop_event.set()
+            self.stop("rejected")
             raise WorkerError("控制台拒绝 Worker 凭据或会话已由其他 Worker 接管")
+        if response.status_code >= 500:
+            raise ControlUnavailable(f"控制台请求失败（HTTP {response.status_code}）")
         if not 200 <= response.status_code < 300:
             raise WorkerError(f"控制台请求失败（HTTP {response.status_code}）")
         self.last_contact = time.monotonic()
@@ -1161,7 +1241,7 @@ class Worker:
                 except (requests.RequestException, WorkerError, ValueError):
                     # A lost control connection never extends the GPU lifetime.
                     if time.monotonic() - self.last_contact > 45:
-                        self.stop_event.set()
+                        self.stop("lost_contact")
                 self.stop_event.wait(5)
 
     def stop_model(self):
@@ -1214,9 +1294,9 @@ class Worker:
             cmd, cwd, env, launch = prepare_llama(settings, self.work_dir, self.model_key, port=self.model_port)
             alias, info["context"], info["vision"], info["preset"] = (
                 launch["alias"], launch["context"], launch["vision"], launch["preset"])
-            if launch.get("speculative"):
-                info["speculative"] = launch["speculative"]
-                info["spec_draft_n_max"] = launch["spec_draft_n_max"]
+            for field in ("speculative", "spec_draft_n_max", "split_mode", "kv_type"):
+                if launch.get(field):
+                    info[field] = launch[field]
         else:
             cmd, cwd, env = prepare_config(settings, self.work_dir, self.model_key, port=self.model_port)
         self.backend = backend
@@ -1294,7 +1374,10 @@ class Worker:
         payload = {"worker_id": self.worker_id, "lease_token": job["lease_token"],
                    "seq": seq, "chunks": chunks}
         last_error = None
-        for attempt in range(3):
+        # The console stores each seq once and accepts an identical repeat, so
+        # a dropped request or a 5xx is retried. One 502 from the tunnel used
+        # to fail a request whose prompt the model had already read.
+        for pause in (*CONTROL_RETRY_PAUSES, None):
             if cancel_event.is_set():
                 raise JobCancelled("调用方已断开连接，推理已取消")
             try:
@@ -1303,11 +1386,12 @@ class Worker:
                     self.cancel_active_job(job["id"])
                     raise JobCancelled("调用方已断开连接，推理已取消")
                 return
-            except (requests.RequestException, ValueError) as exc:
+            except (requests.RequestException, ValueError, ControlUnavailable) as exc:
                 last_error = exc
-                if attempt < 2:
-                    cancel_event.wait(0.25)
-        raise WorkerError(f"流式结果上传失败（{type(last_error).__name__}）；不会自动重复推理")
+                if pause is not None:
+                    cancel_event.wait(pause)
+        detail = str(last_error) if isinstance(last_error, WorkerError) else type(last_error).__name__
+        raise WorkerError(f"流式结果上传失败（{detail}）；不会自动重复推理")
 
     def stream_chat(self, job, payload, deadline, cancel_event):
         data = dict(payload)
@@ -1416,7 +1500,7 @@ class Worker:
                 return {**result, "message": "模型切换完成"}
             self.stop_model()
             if action == "shutdown":
-                self.stop_event.set()
+                self.stop("shutdown")
             return {"message": "模型已停止" if action == "stop_model" else "Worker 会话已结束"}
         if job.get("type") != "chat":
             raise WorkerError("不允许的任务类型")
@@ -1472,7 +1556,8 @@ class Worker:
                 self.stop_model()
                 box = {"error": "任务或会话已到期，推理已终止；不会自动重复执行"}
                 # Keep a stuck execution thread from racing a later model load.
-                self.stop_event.set()
+                self.stop("max_runtime" if time.monotonic() >= self.started + self.max_runtime
+                          else "job_expired")
                 break
         if cancel_event.is_set() and not box.get("error"):
             box = {"cancelled": box.get("cancelled") or "调用方已断开连接，推理已取消"}
@@ -1486,17 +1571,19 @@ class Worker:
             reply = {"worker_id": self.worker_id, "lease_token": job["lease_token"],
                      "status": "failed" if box.get("error") else "completed", **box}
         # Completion reports are idempotent. Retry only the report, never inference.
-        for attempt in range(3):
+        # A 5xx is retried too: left unreported, the job stays "running" on the
+        # console and holds the queue until it expires.
+        for pause in (*CONTROL_RETRY_PAUSES, None):
             try:
                 self.request(session, "POST", f"/worker/jobs/{job['id']}/result", json=reply)
                 break
+            except (requests.RequestException, ValueError, ControlUnavailable):
+                if pause is None:
+                    self.stop("lost_contact")
+                else:
+                    time.sleep(pause)
             except WorkerError:
                 break
-            except (requests.RequestException, ValueError):
-                if attempt == 2:
-                    self.stop_event.set()
-                else:
-                    time.sleep(0.5)
         if box.get("cancelled"):
             self.log("任务已取消：" + box["cancelled"], "warning")
         elif box.get("error"):
@@ -1513,18 +1600,25 @@ class Worker:
         self.last_activity = time.monotonic()
 
     def run(self):
-        self.log("Kaggle Worker 启动；默认空闲 8 分钟或最多 3 小时退出")
+        self.log(f"Kaggle Worker 启动；空闲 {describe_duration(self.idle_timeout)}"
+                 f"或运行满 {describe_duration(self.max_runtime)}后自动退出")
         heartbeat = threading.Thread(target=self.heartbeat_loop, daemon=True)
         heartbeat.start()
         try:
             while not self.registered.wait(0.2):
                 if self.stop_event.is_set() or time.monotonic() - self.started >= min(45, self.max_runtime):
+                    self.stop("register_failed")
                     raise WorkerError("无法登记 Worker，未启动模型")
             with self.session() as s:
                 while not self.stop_event.is_set():
                     now = time.monotonic()
-                    if now - self.started >= self.max_runtime or now - self.last_activity >= self.idle_timeout:
-                        self.log("达到会话或空闲时限，正在停止模型")
+                    if now - self.started >= self.max_runtime:
+                        self.log(f"已运行满 {describe_duration(self.max_runtime)}，正在停止模型并结束 Worker")
+                        self.stop("max_runtime")
+                        break
+                    if now - self.last_activity >= self.idle_timeout:
+                        self.log(f"已连续空闲 {describe_duration(self.idle_timeout)}，自动停止模型并结束 Worker")
+                        self.stop("idle")
                         break
                     try:
                         result = self.request(s, "GET", "/worker/jobs", params={"worker_id": self.worker_id})
@@ -1534,18 +1628,33 @@ class Worker:
                             self.stop_event.wait(2)
                     except (requests.RequestException, WorkerError, ValueError):
                         if time.monotonic() - self.last_contact > 45:
+                            self.stop("lost_contact")
                             break
                         self.stop_event.wait(3)
         except KeyboardInterrupt:
             self.log("Notebook 手动中断，正在停止模型")
+            self.stop("interrupted")
+        except BaseException:
+            self.stop("crashed")
+            raise
         finally:
-            self.stop_event.set()
+            self.stop("unknown")
             self.stop_model()
             heartbeat.join(timeout=9)
+            # The heartbeat thread stops with stop_event, so whatever was
+            # logged on the way out (notably why the session ended) goes here.
+            with self.log_lock:
+                logs = self.logs[:]
+            final = {"worker_id": self.worker_id, "status": "stopped", "model": self.model, "metrics": metrics(),
+                     "runtime_seconds": time.monotonic() - self.started, "logs": logs}
             try:
                 with self.session() as s:
-                    self.request(s, "POST", "/worker/heartbeat", json={"worker_id": self.worker_id, "status": "stopped",
-                                 "model": self.model, "metrics": metrics(), "runtime_seconds": time.monotonic() - self.started})
+                    try:
+                        self.request(s, "POST", "/worker/heartbeat", json={**final, "stop_reason": self.stop_reason})
+                    except WorkerError:
+                        # A console older than 0.9.6 rejects the extra field;
+                        # the plain form is also the one retry after a 5xx.
+                        self.request(s, "POST", "/worker/heartbeat", json=final)
             except Exception:
                 pass
             print("Worker 和模型进程已结束。请在 Kaggle 页面确认停止 Session，以释放配额。")

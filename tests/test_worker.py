@@ -12,9 +12,9 @@ import time
 import pytest
 
 from agent.notebook import build_notebook
-from agent.worker import (IDLE_TIMEOUT, LLAMA_MMPROJ_SOURCE_COMMIT, LLAMA_STREAM_HELPER,
-                          ChatCompletionAccumulator, JobCancelled, ModelDiagnostics, Worker,
-                          WorkerError, prepare_config, prepare_llama, server_origin)
+from agent.worker import (IDLE_TIMEOUT, LLAMA_MMPROJ_SOURCE_COMMIT, LLAMA_STREAM_HELPER, MAX_RUNTIME,
+                          ChatCompletionAccumulator, ControlUnavailable, JobCancelled, ModelDiagnostics, Worker,
+                          WorkerError, describe_duration, prepare_config, prepare_llama, server_origin)
 
 
 @pytest.fixture
@@ -122,8 +122,10 @@ def test_prepare_llama_autodiscovers_verified_inputs_and_keeps_key_out_of_argv(t
     assert info == {"alias": "qwen3.8-27b", "context": 131072, "vision": True,
                     "preset": "qwen38_27b"}
     assert cwd == runtime and env["CUDA_VISIBLE_DEVICES"] == "0,1"
-    assert env["LLAMA_ARG_API_KEY"] == "local-model-secret"
-    assert "LLAMA_API_KEY" not in env
+    # --api-key reads LLAMA_API_KEY; the LLAMA_ARG_ spelling is ignored by
+    # llama-server and left the loopback API open on the real runtime.
+    assert env["LLAMA_API_KEY"] == "local-model-secret"
+    assert "LLAMA_ARG_API_KEY" not in env
     assert "local-model-secret" not in " ".join(cmd)
 
     mtp_cmd, _, _, mtp_info = prepare_llama(
@@ -156,6 +158,78 @@ def test_prepare_llama_autodiscovers_verified_inputs_and_keeps_key_out_of_argv(t
         prepare_llama(
             {"llama_preset": "qwen38_27b_mtp", "llama_mmproj_path": str(mmproj)},
             runtime / "mtp-vision-worker", "local-model-secret", [mounted])
+
+
+def test_prepare_llama_fast_presets_use_tensor_split_and_per_kv_limits(tmp_path, monkeypatch):
+    mounted = tmp_path / "mounted"
+    mounted.mkdir()
+    (mounted / "Qwen3.8-27B-UD-Q4_K_M.gguf").write_bytes(b"GGUF" + b"model")
+    (mounted / "llama-server").write_bytes(b"ELF" + b"binary")
+    mmproj = mounted / "mmproj-F16.gguf"
+    mmproj.write_bytes(b"GGUF" + b"vision")
+    # An inherited key must not survive into the server environment.
+    monkeypatch.setenv("LLAMA_API_KEY", "inherited")
+    monkeypatch.setenv("LLAMA_ARG_API_KEY", "inherited")
+
+    # Without a saved KV type tensor split falls back to f16, its fastest.
+    cmd, _, env, info = prepare_llama(
+        {"llama_preset": "qwen38_27b_fast", "llama_tensor_split": "1,1",
+         "llama_batch_size": 1024, "llama_ubatch_size": 256},
+        tmp_path / "fast", "local-model-secret", [mounted], port=19093)
+    assert cmd[cmd.index("--split-mode") + 1] == "tensor"
+    assert cmd[cmd.index("--fit") + 1] == "off"
+    assert cmd[cmd.index("--ctx-size") + 1] == "180224"
+    assert cmd[cmd.index("--cache-type-k") + 1] == cmd[cmd.index("--cache-type-v") + 1] == "f16"
+    assert cmd[cmd.index("--spec-type") + 1] == "draft-mtp,ngram-mod"
+    assert cmd[cmd.index("--spec-draft-n-max") + 1] == "2"
+    assert cmd[cmd.index("--spec-ngram-mod-n-match") + 1] == "16"
+    assert cmd[cmd.index("--spec-ngram-mod-n-min") + 1] == "12"
+    assert cmd[cmd.index("--spec-ngram-mod-n-max") + 1] == "32"
+    assert "--mmproj" not in cmd
+    assert info == {"alias": "qwen3.8-27b", "context": 180224, "vision": False,
+                    "preset": "qwen38_27b_fast", "split_mode": "tensor", "kv_type": "f16",
+                    "speculative": "draft-mtp,ngram-mod", "spec_draft_n_max": 2}
+    assert env["LLAMA_API_KEY"] == "local-model-secret" and "LLAMA_ARG_API_KEY" not in env
+    assert "local-model-secret" not in " ".join(cmd)
+
+    vision_cmd, _, _, vision_info = prepare_llama(
+        {"llama_preset": "qwen38_27b_fast_vision", "llama_tensor_split": "1,1",
+         "llama_batch_size": 1024, "llama_ubatch_size": 256},
+        tmp_path / "fast-vision", "local-model-secret", [mounted], port=19094)
+    assert vision_cmd[vision_cmd.index("--split-mode") + 1] == "tensor"
+    assert vision_cmd[vision_cmd.index("--ctx-size") + 1] == "139264"
+    assert vision_cmd[vision_cmd.index("--mmproj") + 1] == str(mmproj)
+    assert vision_info["vision"] is True and vision_info["context"] == 139264
+
+    # Measured f16 limits: 184,320 for text, 147,456 with the projector on
+    # GPU. Q8 KV is half the size and takes both presets to 204,800.
+    limits = (("qwen38_27b_fast", "f16", 184320), ("qwen38_27b_fast_vision", "f16", 147456),
+              ("qwen38_27b_fast", "q8_0", 204800), ("qwen38_27b_fast_vision", "q8_0", 204800))
+    for preset, kv, context in limits:
+        ok_cmd, _, _, ok_info = prepare_llama(
+            {"llama_preset": preset, "llama_kv_type": kv, "llama_context_length": context},
+            tmp_path / "fast-max", "local-model-secret", [mounted])
+        assert ok_cmd[ok_cmd.index("--split-mode") + 1] == "tensor"
+        assert ok_cmd[ok_cmd.index("--cache-type-k") + 1] == ok_cmd[ok_cmd.index("--cache-type-v") + 1] == kv
+        assert ok_info["kv_type"] == kv and ok_info["context"] == context
+        with pytest.raises(WorkerError, match=f"用 {kv} KV 实测最多 {context} "):
+            prepare_llama({"llama_preset": preset, "llama_kv_type": kv, "llama_context_length": context + 1},
+                          tmp_path / "fast-over", "local-model-secret", [mounted])
+    with pytest.raises(WorkerError, match="不支持的 KV 缓存精度"):
+        prepare_llama({"llama_preset": "qwen38_27b_fast", "llama_kv_type": "q4_0"},
+                      tmp_path / "fast-q4", "local-model-secret", [mounted])
+    with pytest.raises(WorkerError, match="高速纯文本预设不加载视觉投影"):
+        prepare_llama({"llama_preset": "qwen38_27b_fast", "llama_mmproj_path": str(mmproj)},
+                      tmp_path / "fast-mmproj", "local-model-secret", [mounted])
+
+    # The layer-split presets keep their flags.
+    stable, _, _, stable_info = prepare_llama(
+        {"llama_preset": "qwen38_27b_mtp", "llama_kv_type": "q8_0"},
+        tmp_path / "stable", "local-model-secret", [mounted])
+    assert stable[stable.index("--split-mode") + 1] == "layer"
+    assert "--fit" not in stable and "--spec-ngram-mod-n-match" not in stable
+    assert stable[stable.index("--cache-type-k") + 1] == "q8_0"
+    assert "split_mode" not in stable_info and "kv_type" not in stable_info
 
 
 def test_prepare_llama_256k_defaults_and_rejects_ambiguous_or_invalid_inputs(tmp_path):
@@ -770,6 +844,114 @@ def test_job_wall_deadline_stops_model_without_replay(monkeypatch):
     assert time.monotonic() - before < 1.5
     assert stopped and calls == ["job1"] and worker.stop_event.is_set()
     assert reports[0]["status"] == "failed" and reports[0]["lease_token"] == "lease1"
+    assert worker.stop_reason == "max_runtime"
+
+
+class StatusResponse:
+    def __init__(self, status_code):
+        self.status_code = status_code
+
+    def json(self):
+        return {"ok": True}
+
+
+class StatusSession:
+    def __init__(self, *status_codes):
+        self.status_codes = list(status_codes)
+
+    def request(self, method, url, **kwargs):
+        return StatusResponse(self.status_codes.pop(0))
+
+
+def test_console_5xx_is_retryable_and_only_a_refusal_ends_the_session():
+    worker = Worker("https://example.com", "x" * 32)
+    # A 502 from the tunnel says nothing about this worker: it is its own
+    # error type so callers can retry, and it does not end the session.
+    with pytest.raises(ControlUnavailable, match="HTTP 502"):
+        worker.request(StatusSession(502), "GET", "/worker/jobs")
+    with pytest.raises(WorkerError, match="HTTP 404") as plain:
+        worker.request(StatusSession(404), "GET", "/worker/jobs")
+    assert not isinstance(plain.value, ControlUnavailable)
+    assert not worker.stop_event.is_set() and worker.stop_reason is None
+    with pytest.raises(WorkerError, match="拒绝"):
+        worker.request(StatusSession(409), "GET", "/worker/jobs")
+    assert worker.stop_event.is_set() and worker.stop_reason == "rejected"
+    # The first reason stays: later stops are consequences of it.
+    worker.stop("idle")
+    assert worker.stop_reason == "rejected"
+
+
+def test_chunk_upload_survives_a_transient_502(monkeypatch):
+    monkeypatch.setattr("agent.worker.CONTROL_RETRY_PAUSES", (0, 0, 0))
+    worker = Worker("https://example.com", "x" * 32)
+    job = {"id": "job-1", "lease_token": "lease"}
+    sent = []
+
+    def flaky(session, method, path, **kw):
+        sent.append(kw["json"])
+        if len(sent) < 3:
+            raise ControlUnavailable("控制台请求失败（HTTP 502）")
+        return {"ok": True, "cancel_requested": False}
+
+    monkeypatch.setattr(worker, "request", flaky)
+    worker.upload_stream_batch(None, job, 4, [{"choices": []}], threading.Event())
+    # The same seq and chunks every time: the console accepts an identical repeat.
+    assert len(sent) == 3 and all(item == sent[0] for item in sent) and sent[0]["seq"] == 4
+
+    attempts = []
+
+    def down(session, method, path, **kw):
+        attempts.append(path)
+        raise ControlUnavailable("控制台请求失败（HTTP 502）")
+
+    monkeypatch.setattr(worker, "request", down)
+    with pytest.raises(WorkerError, match="HTTP 502.*不会自动重复推理"):
+        worker.upload_stream_batch(None, job, 5, [{"choices": []}], threading.Event())
+    assert len(attempts) == 4 and not worker.stop_event.is_set()
+
+    # Anything else the console says (a 4xx) is final and is not retried.
+    refused = []
+
+    def refuse(session, method, path, **kw):
+        refused.append(path)
+        raise WorkerError("控制台请求失败（HTTP 413）")
+
+    monkeypatch.setattr(worker, "request", refuse)
+    with pytest.raises(WorkerError, match="HTTP 413"):
+        worker.upload_stream_batch(None, job, 6, [{"choices": []}], threading.Event())
+    assert len(refused) == 1
+
+
+def test_result_report_is_retried_after_5xx(monkeypatch):
+    monkeypatch.setattr("agent.worker.CONTROL_RETRY_PAUSES", (0, 0, 0))
+    job = {"id": "job-1", "lease_token": "lease", "type": "chat", "payload": {}, "expires_at": time.time() + 50}
+
+    def run_with(replies):
+        worker = Worker("https://example.com", "x" * 32)
+        calls = []
+
+        def req(session, method, path, **kw):
+            calls.append(kw["json"]["status"])
+            reply = replies.pop(0) if replies else ControlUnavailable("控制台请求失败（HTTP 502）")
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        monkeypatch.setattr(worker, "perform", lambda job, deadline: {"choices": []})
+        monkeypatch.setattr(worker, "request", req)
+        worker.execute_job(dict(job), None)
+        return worker, calls
+
+    # One 502, then the report lands: the inference ran once and the session goes on.
+    worker, calls = run_with([ControlUnavailable("控制台请求失败（HTTP 502）"), {"ok": True}])
+    assert calls == ["completed", "completed"] and not worker.stop_event.is_set()
+    # The console stays down: the worker gives up the session rather than hold
+    # a job the console still shows as running.
+    worker, calls = run_with([])
+    assert len(calls) == 4 and worker.stop_event.is_set() and worker.stop_reason == "lost_contact"
+    # A definite answer (the job is gone, the lease is stale) is not retried.
+    worker, calls = run_with([WorkerError("控制台请求失败（HTTP 404）")])
+    assert calls == ["completed"] and not worker.stop_event.is_set()
 
 
 def test_worker_waits_for_registration_before_claim(monkeypatch):
@@ -792,6 +974,134 @@ def test_worker_waits_for_registration_before_claim(monkeypatch):
     monkeypatch.setattr("agent.worker.metrics", lambda: {"gpus": []})
     worker.run()
     assert order == ["registered", "claim"]
+
+
+def run_idle_worker(monkeypatch, worker, jobs=(), job_seconds=0.0):
+    """Run a worker against a fake console until it stops; return what it sent.
+
+    Durations are measured from worker.started, the clock the limits use. The
+    assertions leave slack for the 16 ms monotonic tick on Windows.
+    """
+    heartbeats, performed, pending = [], [], list(jobs)
+
+    def req(s, m, p, **kw):
+        if p == "/worker/heartbeat":
+            heartbeats.append(kw["json"])
+            return {"ok": True, "settings": {}}
+        if p == "/worker/jobs":
+            if pending:
+                return {"job": {"id": pending.pop(0), "lease_token": "lease", "type": "chat",
+                                "payload": {}, "expires_at": time.time() + 50}}
+            return {"job": None}
+        return {"ok": True}
+
+    def perform(job, deadline):
+        performed.append(job["id"])
+        time.sleep(job_seconds)
+        return {"choices": []}
+
+    real_wait = worker.stop_event.wait
+    monkeypatch.setattr(worker.stop_event, "wait", lambda timeout=None: real_wait(min(timeout or 0.05, 0.05)))
+    monkeypatch.setattr(worker, "request", req)
+    monkeypatch.setattr(worker, "perform", perform)
+    monkeypatch.setattr(worker, "refresh_model", lambda: None)
+    monkeypatch.setattr(worker, "stop_model", lambda: None)
+    monkeypatch.setattr("agent.worker.metrics", lambda: {"gpus": []})
+    worker.run()
+    messages = [line["message"] for beat in heartbeats for line in beat.get("logs", [])]
+    return heartbeats, performed, messages, time.monotonic() - worker.started
+
+
+def test_idle_worker_stops_itself_and_reports_why(monkeypatch):
+    worker = Worker("https://example.com", "x" * 32, idle_timeout=0.3)
+    heartbeats, performed, messages, elapsed = run_idle_worker(monkeypatch, worker)
+    assert performed == [] and 0.25 <= elapsed < 3
+    assert worker.stop_event.is_set()
+    assert heartbeats[-1]["status"] == "stopped" and heartbeats[-1]["stop_reason"] == "idle"
+    # Only the last report says why; ordinary heartbeats carry no reason.
+    assert all("stop_reason" not in beat for beat in heartbeats[:-1])
+    # The reason is logged as the heartbeat thread stops, so it has to travel
+    # with the final "stopped" report or the console never learns why.
+    assert len([message for message in messages if "已连续空闲" in message]) == 1
+    assert not any("已运行满" in message for message in messages)
+
+
+def test_jobs_longer_than_the_idle_limit_do_not_end_the_session(monkeypatch):
+    worker = Worker("https://example.com", "x" * 32, idle_timeout=0.3)
+    _, performed, messages, elapsed = run_idle_worker(
+        monkeypatch, worker, jobs=["job-1", "job-2"], job_seconds=0.6)
+    # Each job outlasts the idle limit; the clock restarts when a job ends, so
+    # the second one is still claimed and the session ends only afterwards.
+    assert performed == ["job-1", "job-2"] and elapsed >= 1.4
+    assert any("已连续空闲" in message for message in messages)
+
+
+def test_max_runtime_ends_the_session_with_its_own_reason(monkeypatch):
+    worker = Worker("https://example.com", "x" * 32, max_runtime=0.6)
+    heartbeats, _, messages, elapsed = run_idle_worker(monkeypatch, worker)
+    assert elapsed < 3 and heartbeats[-1]["status"] == "stopped"
+    assert heartbeats[-1]["stop_reason"] == "max_runtime"
+    assert any("已运行满" in message for message in messages)
+    assert not any("已连续空闲" in message for message in messages)
+
+
+def test_shutdown_command_is_reported_as_the_reason(monkeypatch):
+    worker = Worker("https://example.com", "x" * 32, idle_timeout=5)
+    heartbeats, claimed = [], []
+
+    def req(s, m, p, **kw):
+        if p == "/worker/heartbeat":
+            heartbeats.append(kw["json"])
+            return {"ok": True, "settings": {}}
+        if p == "/worker/jobs" and not claimed:
+            claimed.append(True)
+            return {"job": {"id": "stop-1", "lease_token": "lease", "type": "command",
+                            "payload": {"action": "shutdown"}, "expires_at": time.time() + 50}}
+        return {"ok": True, "job": None}
+
+    monkeypatch.setattr(worker, "request", req)
+    monkeypatch.setattr(worker, "refresh_model", lambda: None)
+    monkeypatch.setattr(worker, "stop_model", lambda: None)
+    monkeypatch.setattr("agent.worker.metrics", lambda: {"gpus": []})
+    worker.run()
+    assert heartbeats[-1]["status"] == "stopped" and heartbeats[-1]["stop_reason"] == "shutdown"
+
+
+def test_final_heartbeat_falls_back_for_a_console_without_stop_reason(monkeypatch):
+    worker = Worker("https://example.com", "x" * 32, idle_timeout=0.2)
+    accepted, rejected = [], []
+
+    def req(s, m, p, **kw):
+        if p == "/worker/heartbeat":
+            if "stop_reason" in kw["json"]:
+                # What a 0.9.5 console does with a field it does not know.
+                rejected.append(kw["json"])
+                raise WorkerError("控制台请求失败（HTTP 422）")
+            accepted.append(kw["json"])
+            return {"ok": True, "settings": {}}
+        return {"ok": True, "job": None}
+
+    real_wait = worker.stop_event.wait
+    monkeypatch.setattr(worker.stop_event, "wait", lambda timeout=None: real_wait(min(timeout or 0.05, 0.05)))
+    monkeypatch.setattr(worker, "request", req)
+    monkeypatch.setattr(worker, "refresh_model", lambda: None)
+    monkeypatch.setattr(worker, "stop_model", lambda: None)
+    monkeypatch.setattr("agent.worker.metrics", lambda: {"gpus": []})
+    worker.run()
+    assert len(rejected) == 1 and rejected[0]["stop_reason"] == "idle"
+    # The session still ends cleanly on the console: same report, minus the field.
+    assert accepted[-1]["status"] == "stopped" and "stop_reason" not in accepted[-1]
+    assert any("已连续空闲" in line["message"] for line in accepted[-1]["logs"])
+
+
+def test_default_limits_are_eight_idle_minutes_and_three_hours():
+    worker = Worker("https://example.com", "x" * 32)
+    assert (worker.idle_timeout, worker.max_runtime) == (IDLE_TIMEOUT, MAX_RUNTIME) == (8 * 60, 3 * 60 * 60)
+    assert describe_duration(IDLE_TIMEOUT) == "8 分钟" and describe_duration(MAX_RUNTIME) == "3 小时"
+    assert describe_duration(90 * 60) == "90 分钟"
+    # Neither limit can be raised past the three-hour session cap.
+    capped = Worker("https://example.com", "x" * 32, idle_timeout=10 * MAX_RUNTIME, max_runtime=10 * MAX_RUNTIME)
+    assert (capped.idle_timeout, capped.max_runtime) == (MAX_RUNTIME, MAX_RUNTIME)
 
 
 def test_notebook_uses_secret_without_embedding_credentials():

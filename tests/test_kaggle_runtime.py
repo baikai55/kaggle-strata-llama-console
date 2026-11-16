@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from agent.notebook import build_runtime_notebook
+from agent.worker import IDLE_TIMEOUT, MAX_RUNTIME
 from app.kaggle_runtime import (
     KAGGLE_RUNTIME_DATASETS,
     KAGGLE_RUNTIME_PUSH_TIMEOUT,
@@ -49,8 +50,8 @@ def test_runtime_notebook_executes_bootstrap_exchange_and_cleans_up(monkeypatch,
             calls["stop_event_set"] = True
 
     class FakeWorker:
-        def __init__(self, server_url, worker_key, *, idle_timeout):
-            calls["worker_init"] = (server_url, worker_key, idle_timeout)
+        def __init__(self, server_url, worker_key, **overrides):
+            calls["worker_init"] = (server_url, worker_key, overrides)
             self.stop_event = FakeStopEvent()
 
         def run(self):
@@ -77,9 +78,23 @@ def test_runtime_notebook_executes_bootstrap_exchange_and_cleans_up(monkeypatch,
     }
     assert trust_env is False and calls["session_closed"] is True
     assert calls["run_path"] == (str(worker_file), "strata_console_runtime_worker")
-    assert calls["worker_init"] == ("https://console.example.com", session_token, 3 * 60 * 60)
+    # No limit overrides: the managed Runtime keeps the Worker's idle auto-stop.
+    assert calls["worker_init"] == ("https://console.example.com", session_token, {})
     assert calls["worker_ran"] is True
     assert calls["stop_event_set"] is True and calls["model_stopped"] is True
+
+
+def test_runtime_notebook_keeps_the_idle_auto_stop_and_says_so():
+    notebook = build_runtime_notebook(
+        "https://console.example.com", Path("agent/worker.py").read_text(encoding="utf-8"),
+        "a" * 32, "sk-strata-bootstrap-" + "b" * 48)
+    launch = "".join(notebook["cells"][-1]["source"])
+    assert "idle_timeout" not in launch and "max_runtime" not in launch and "MAX_RUNTIME" not in launch
+    # The same figure is promised in the notebook and on the admin page.
+    assert IDLE_TIMEOUT == 8 * 60 and MAX_RUNTIME == 3 * 60 * 60
+    assert "连续空闲 8 分钟" in "".join(notebook["cells"][0]["source"])
+    for page in ("static/app.js", "static/index.html"):
+        assert "连续空闲 8 分钟" in Path(page).read_text(encoding="utf-8")
 
 
 def test_runtime_push_uses_fixed_private_bundle_and_isolates_token(monkeypatch):
@@ -143,6 +158,9 @@ def test_runtime_push_uses_fixed_private_bundle_and_isolates_token(monkeypatch):
         ('job579/runtime has status "KernelWorkerStatus.QUEUED"', "queued"),
         ('job579/runtime has status "RUNNING"', "running"),
         ('job579/runtime has status "COMPLETE"', "complete"),
+        ('job579/runtime has status "KernelWorkerStatus.CANCEL_ACKNOWLEDGED"', "cancelled"),
+        ('job579/runtime has status "CANCEL_ACKNOWLEDGED"', "cancelled"),
+        ('job579/runtime has status "KernelWorkerStatus.CANCEL_REQUESTED"', "cancelling"),
         ('job579/runtime has status "ERROR"\nFailure message: "secret access missing"', "error"),
     ],
 )
