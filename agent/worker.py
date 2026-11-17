@@ -744,6 +744,9 @@ def prepare_llama(settings: dict, work_dir: Path, model_key: str,
                     or str(manifest.get("mmproj_source_commit", "")).lower() != spec["mmproj_source_commit"]):
                 raise WorkerError("llama.cpp Dataset 清单与视觉投影不匹配")
     context = number(settings.get("llama_context_length", spec["context"]), "上下文长度", 1024, 1048576)
+    parallel = number(settings.get("llama_parallel", 1), "并发请求数", 1, 2)
+    if context % parallel:
+        raise WorkerError("总上下文长度必须能被并发请求数整除")
     tensor_split = spec["split_mode"] == "tensor"
     kv = settings.get("llama_kv_type") or ("f16" if tensor_split else "q8_0")
     if kv not in LLAMA_KV_TYPES:
@@ -797,13 +800,17 @@ def prepare_llama(settings: dict, work_dir: Path, model_key: str,
     cmd = [str(server), "--model", str(model), "--alias", alias,
            "--n-gpu-layers", "999", "--split-mode", spec["split_mode"], "--tensor-split", split,
            "--main-gpu", "0",
-           "--ctx-size", str(context), "--parallel", "1", "--batch-size", str(batch),
+           "--ctx-size", str(context), "--parallel", str(parallel), "--batch-size", str(batch),
            "--ubatch-size", str(ubatch), "--flash-attn", "on", "--cache-type-k", kv,
            "--cache-type-v", kv, "--threads", "4", "--threads-batch", "4", "--jinja",
            "--host", "127.0.0.1", "--port", str(port), "--metrics"]
     if tensor_split:
         # Auto-fit is not supported with tensor split.
         cmd.extend(["--fit", "off"])
+    if parallel > 1:
+        # Reserve each slot's own KV pool. A unified pool can exhaust the
+        # combined budget and fail both active requests in the pinned build.
+        cmd.append("--no-kv-unified")
     if spec["spec_type"]:
         cmd.extend(["--spec-type", spec["spec_type"],
                     "--spec-draft-n-max", str(spec["spec_draft_n_max"])])
@@ -812,7 +819,8 @@ def prepare_llama(settings: dict, work_dir: Path, model_key: str,
                 cmd.extend([flag, str(value)])
     if mmproj is not None:
         cmd.extend(["--mmproj", str(mmproj)])
-    info = {"alias": alias, "context": context, "vision": mmproj is not None,
+    info = {"alias": alias, "context": context // parallel, "context_total": context,
+            "parallel": parallel, "vision": mmproj is not None,
             "preset": preset}
     if tensor_split:
         info.update({"split_mode": "tensor", "kv_type": kv})
@@ -1009,11 +1017,7 @@ class Worker:
         self.log_lock = threading.Lock()
         self.process_lock = threading.Lock()
         self.active_lock = threading.Lock()
-        self.active_job = None
-        self.active_cancel_event = None
-        self.active_model_response = None
-        self.active_model_session = None
-        self.active_model_transport = None
+        self.active_jobs = {}
         self.last_contact = self.started
 
     def redact(self, message: str):
@@ -1135,38 +1139,34 @@ class Worker:
     def set_active_transport(self, job_id, *, session=None, response=None, transport=None):
         close_now = []
         with self.active_lock:
-            if self.active_job != job_id:
-                close_now = [item for item in (session, response, transport) if item is not None]
-            elif self.active_cancel_event is not None and self.active_cancel_event.is_set():
+            active = self.active_jobs.get(job_id)
+            if active is None or active["cancel_event"].is_set():
                 close_now = [item for item in (session, response, transport) if item is not None]
             else:
                 if session is not None:
-                    self.active_model_session = session
+                    active["session"] = session
                 if response is not None:
-                    self.active_model_response = response
+                    active["response"] = response
                 if transport is not None:
-                    self.active_model_transport = transport
+                    active["transport"] = transport
         for item in close_now:
             self.interrupt_stream_transport(item)
         return not close_now
 
     def clear_active_transport(self, job_id, transport=None):
         with self.active_lock:
-            if self.active_job == job_id and (transport is None or self.active_model_transport is transport):
-                self.active_model_response = None
-                self.active_model_session = None
-                self.active_model_transport = None
+            active = self.active_jobs.get(job_id)
+            if active is not None and (transport is None or active.get("transport") is transport):
+                for field in ("response", "session", "transport"):
+                    active[field] = None
 
     def cancel_active_job(self, job_id):
         with self.active_lock:
-            if not job_id or self.active_job != job_id:
+            active = self.active_jobs.get(job_id)
+            if active is None:
                 return False
-            cancel_event = self.active_cancel_event
-            response = self.active_model_response
-            session = self.active_model_session
-            transport = self.active_model_transport
-            if cancel_event is not None:
-                cancel_event.set()
+            response, session, transport = (active.get(field) for field in ("response", "session", "transport"))
+            active["cancel_event"].set()
         # Closing the streaming response propagates the disconnect to llama.cpp
         # without terminating the loaded model process or a later request.
         for item in (response, session, transport):
@@ -1196,29 +1196,46 @@ class Worker:
         except (requests.RequestException, ValueError, KeyError, TypeError):
             return None
 
+    def verify_parallel_slots(self, session, expected):
+        try:
+            slots = session.get(self.model_url("/slots"), timeout=(1, 3)).json()
+            contexts = [slot["n_ctx"] for slot in slots]
+            if (len(slots) != expected or not all(type(value) is int and value > 0 for value in contexts)
+                    or len(set(contexts)) != 1):
+                raise ValueError
+            return contexts[0]
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            raise WorkerError("llama.cpp 未确认两路独立上下文，不能开放并发") from None
+
     def speculative_loaded(self, session):
         try:
             slots = session.get(self.model_url("/slots"), timeout=(1, 3)).json()
-            return isinstance(slots, list) and any(
+            expected = self.model.get("parallel", 1)
+            return isinstance(slots, list) and len(slots) >= expected and all(
                 isinstance(slot, dict) and slot.get("speculative") is True for slot in slots)
         except (requests.RequestException, ValueError, TypeError):
             return False
 
     def refresh_model(self):
         process = self.process
+        model = self.model
         if process is None:
             return
         if process.poll() is not None:
-            self.model["status"] = "error"
-            self.status = "error"
+            if self.process is process and self.model is model:
+                model["status"] = "error"
+                self.status = "error"
             return
-        if self.model["status"] == "loading":
+        if model["status"] == "loading":
             return
         try:
             with self.model_session() as s:
-                self.model["status"] = "ready" if self.model_loaded(s) else "error"
+                loaded = self.model_loaded(s)
+                if self.process is process and self.model is model and model["status"] != "loading":
+                    model["status"] = "ready" if loaded else "error"
         except (requests.RequestException, ValueError):
-            self.model["status"] = "error"
+            if self.process is process and self.model is model:
+                model["status"] = "error"
 
     def heartbeat_loop(self):
         with self.session() as s:
@@ -1234,7 +1251,13 @@ class Worker:
                     self.registered.set()
                     self.settings = reply.get("settings", {})
                     cancel_job_id = reply.get("cancel_job_id")
-                    if isinstance(cancel_job_id, str):
+                    cancel_job_ids = reply.get("cancel_job_ids", [])
+                    if not isinstance(cancel_job_ids, list):
+                        cancel_job_ids = []
+                    for job_id in cancel_job_ids:
+                        if isinstance(job_id, str):
+                            self.cancel_active_job(job_id)
+                    if isinstance(cancel_job_id, str) and cancel_job_id not in cancel_job_ids:
                         self.cancel_active_job(cancel_job_id)
                     with self.log_lock:
                         del self.logs[:len(logs)]
@@ -1294,6 +1317,7 @@ class Worker:
             cmd, cwd, env, launch = prepare_llama(settings, self.work_dir, self.model_key, port=self.model_port)
             alias, info["context"], info["vision"], info["preset"] = (
                 launch["alias"], launch["context"], launch["vision"], launch["preset"])
+            info.update(parallel=launch["parallel"], context_total=launch["context_total"])
             for field in ("speculative", "spec_draft_n_max", "split_mode", "kv_type"):
                 if launch.get(field):
                     info[field] = launch[field]
@@ -1331,14 +1355,24 @@ class Worker:
                         if not name:
                             raise WorkerError(f"{label} 未报告模型标识")
                         if backend == "llama_cpp":
+                            self.model.update(parallel=info["parallel"])
                             if info.get("speculative") and not self.speculative_loaded(s):
                                 raise WorkerError("llama.cpp 已就绪，但 MTP 投机解码没有实际激活")
                             info["context"] = self.loaded_context(s) or info["context"]
+                            if info["parallel"] > 1:
+                                actual_context = self.verify_parallel_slots(s, info["parallel"])
+                                if actual_context * info["parallel"] > info["context_total"]:
+                                    raise WorkerError("llama.cpp 上下文没有按独立槽分配，不能开放并发")
+                                info["context"] = actual_context
                             self.log(f"llama.cpp 已就绪：{name}，上下文 {info['context']}")
                         else:
                             self.log("Strata 已报告模型加载完成；128K 长文档质量仍需另行实测")
-                        self.model = {"name": name, "status": "ready", **info}
-                        self.status = "ready"
+                        with self.process_lock:
+                            if (self.stop_event.is_set() or self.process is not process
+                                    or process.poll() is not None or time.monotonic() >= deadline):
+                                raise WorkerError("模型就绪检查期间会话或进程已结束")
+                            self.model = {"name": name, "status": "ready", **info}
+                            self.status = "ready"
                         return {"message": "模型加载完成"}
                 except requests.RequestException:
                     pass
@@ -1507,7 +1541,8 @@ class Worker:
         if self.model.get("status") != "ready" or self.process is None or self.process.poll() is not None:
             raise WorkerError("模型尚未就绪")
         with self.active_lock:
-            cancel_event = self.active_cancel_event if self.active_job == job.get("id") else None
+            active = self.active_jobs.get(job.get("id"))
+            cancel_event = active["cancel_event"] if active is not None else None
         cancel_event = cancel_event or threading.Event()
         if self.backend == "llama_cpp":
             return self.stream_chat(job, payload, deadline, cancel_event)
@@ -1533,11 +1568,10 @@ class Worker:
         cancel_event = threading.Event()
         box = {}
         with self.active_lock:
-            self.active_job = job["id"]
-            self.active_cancel_event = cancel_event
-            self.active_model_response = None
-            self.active_model_session = None
-            self.active_model_transport = None
+            if job["id"] in self.active_jobs:
+                raise WorkerError("同一个任务不能重复执行")
+            self.active_jobs[job["id"]] = {"cancel_event": cancel_event,
+                                           "response": None, "session": None, "transport": None}
         self.last_activity = time.monotonic()
         def task():
             try:
@@ -1550,15 +1584,28 @@ class Worker:
                 completed.set()
         runner = threading.Thread(target=task, daemon=True)
         runner.start()
+        expired_chat = False
         while not completed.wait(0.2):
             if self.stop_event.is_set() or time.monotonic() >= deadline:
-                self.cancel_active_job(job["id"])
+                if not expired_chat:
+                    self.cancel_active_job(job["id"])
+                isolated_chat = job.get("type") == "chat" and self.backend == "llama_cpp"
+                if (isolated_chat and not self.stop_event.is_set()
+                        and time.monotonic() < self.started + self.max_runtime):
+                    # The model bridge is closed already, but an in-flight
+                    # control upload may still be draining. Keep this lease
+                    # occupied until its thread exits; never kill the other
+                    # slot because a control HTTP request took more than 5 s.
+                    expired_chat = True
+                    continue
                 self.stop_model()
-                box = {"error": "任务或会话已到期，推理已终止；不会自动重复执行"}
-                # Keep a stuck execution thread from racing a later model load.
+                # A stuck command/Strata thread must not race a later load.
                 self.stop("max_runtime" if time.monotonic() >= self.started + self.max_runtime
                           else "job_expired")
+                box = {"error": "任务或会话已到期，推理已终止；不会自动重复执行"}
                 break
+        if expired_chat:
+            box = {"error": "任务已到期，推理已终止；不会自动重复执行"}
         if cancel_event.is_set() and not box.get("error"):
             box = {"cancelled": box.get("cancelled") or "调用方已断开连接，推理已取消"}
         if (box.get("error") and job.get("type") == "command"
@@ -1591,12 +1638,7 @@ class Worker:
         else:
             self.log("任务执行完成")
         with self.active_lock:
-            if self.active_job == job["id"]:
-                self.active_job = None
-                self.active_cancel_event = None
-                self.active_model_response = None
-                self.active_model_session = None
-                self.active_model_transport = None
+            self.active_jobs.pop(job["id"], None)
         self.last_activity = time.monotonic()
 
     def run(self):
@@ -1604,6 +1646,21 @@ class Worker:
                  f"或运行满 {describe_duration(self.max_runtime)}后自动退出")
         heartbeat = threading.Thread(target=self.heartbeat_loop, daemon=True)
         heartbeat.start()
+        runners = {}
+
+        def execute_claimed(job):
+            try:
+                # requests.Session is not shared between concurrent tasks.
+                with self.session() as task_session:
+                    self.execute_job(job, task_session)
+            except Exception as exc:
+                self.log(f"任务执行线程失败（{type(exc).__name__}）", "error")
+                self.stop("crashed")
+            finally:
+                with self.active_lock:
+                    self.active_jobs.pop(job["id"], None)
+                self.last_activity = time.monotonic()
+
         try:
             while not self.registered.wait(0.2):
                 if self.stop_event.is_set() or time.monotonic() - self.started >= min(45, self.max_runtime):
@@ -1611,21 +1668,32 @@ class Worker:
                     raise WorkerError("无法登记 Worker，未启动模型")
             with self.session() as s:
                 while not self.stop_event.is_set():
+                    runners = {job_id: runner for job_id, runner in runners.items() if runner.is_alive()}
                     now = time.monotonic()
                     if now - self.started >= self.max_runtime:
                         self.log(f"已运行满 {describe_duration(self.max_runtime)}，正在停止模型并结束 Worker")
                         self.stop("max_runtime")
                         break
-                    if now - self.last_activity >= self.idle_timeout:
+                    if not runners and now - self.last_activity >= self.idle_timeout:
                         self.log(f"已连续空闲 {describe_duration(self.idle_timeout)}，自动停止模型并结束 Worker")
                         self.stop("idle")
                         break
+                    capacity = 2 if self.backend == "llama_cpp" and self.model.get("parallel") == 2 else 1
+                    if len(runners) >= capacity:
+                        self.stop_event.wait(0.1)
+                        continue
                     try:
                         result = self.request(s, "GET", "/worker/jobs", params={"worker_id": self.worker_id})
                         if result.get("job"):
-                            self.execute_job(result["job"], s)
+                            job = result["job"]
+                            if job["id"] in runners:
+                                raise WorkerError("控制台重复下发同一个任务")
+                            runner = threading.Thread(target=execute_claimed, args=(job,), daemon=True)
+                            runners[job["id"]] = runner
+                            self.last_activity = time.monotonic()
+                            runner.start()
                         else:
-                            self.stop_event.wait(2)
+                            self.stop_event.wait(0.5)
                     except (requests.RequestException, WorkerError, ValueError):
                         if time.monotonic() - self.last_contact > 45:
                             self.stop("lost_contact")
@@ -1639,7 +1707,14 @@ class Worker:
             raise
         finally:
             self.stop("unknown")
+            with self.active_lock:
+                active_ids = list(self.active_jobs)
+            for job_id in active_ids:
+                self.cancel_active_job(job_id)
             self.stop_model()
+            join_deadline = time.monotonic() + 5
+            for runner in runners.values():
+                runner.join(timeout=max(0, join_deadline - time.monotonic()))
             heartbeat.join(timeout=9)
             # The heartbeat thread stops with stop_event, so whatever was
             # logged on the way out (notably why the session ended) goes here.

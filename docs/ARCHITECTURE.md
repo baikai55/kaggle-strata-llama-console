@@ -51,6 +51,18 @@ Worker 调用控制台的请求遇到 5xx 或网络异常时按 0.25 / 0.5 / 1 /
 
 ## Kaggle 生命周期
 
+### 0.9.7 / 0.9.8 可选双请求并发（已部署并保存双路，双槽真机验收待做）
+
+设置 `llama_parallel=1|2`，默认 1。双槽固定 `--parallel 2 --no-kv-unified`，`llama_context_length` 仍是总 KV 窗口；Worker 上报 `model.parallel`、`context_total` 和每槽 `context`，并读取真实 `/slots` 确认初始化。服务端仅在设置和实际模型都为两路且 backend 为 llama.cpp 时允许两条 chat 在途；控制命令形成 FIFO 屏障，等待全部在途任务退出。过期但尚未收到取消确认的租约继续占执行槽，完成确认时才清除租约。
+
+0.9.8 修复管理页下拉值的序列化：`llama_parallel` 必须转为数字才能符合设置接口的 `Literal[1,2]`。生产已实际保存为 2，总窗口保持 130048，每槽约 65024，单条也不能借用另一槽。双路只调度独立聊天任务，不管理客户端会话历史，也不自动把尚未完成的上一条回复补入第二条。用户要求保留 OpenCode 原窗口声明，客户端长历史仍需注意每槽上限。
+
+本机 OpenCode 1.18.25 的普通 TUI 同会话忙时提交会先保存新用户消息，随后 `SessionPrompt.loop` / `SessionRunState.ensureRunning` 按 sessionID 复用既有 runner，等待同一 `run.done`，不创建并行模型生成。追加消息由同一会话后续处理；服务器双槽不会改变这层客户端会话调度。
+
+Worker 主循环轮询并为每个任务启动独立线程和控制 HTTP Session，`active_jobs` 按任务 ID 保存取消事件及模型桥接。心跳返回 `cancel_job_ids` 列表，兼容旧单字段。单条到期/断开仅取消其模型连接，慢控制上传尚未退出时不重用该槽；会话级停止才关闭整个模型。空闲停止只在没有执行线程时判断。
+
+管理员 `GET /api/jobs/{id}/stream` 使用管理员 Cookie，输出与公开 API 相同的 OpenAI SSE，另有 `event: status` 通知排队/执行变化。`POST /api/jobs/{id}/cancel` 受管理员鉴权与 Origin 校验，只接受聊天任务。管理页逐步累加文本、思考、工具参数和 usage，流关闭取消该任务；不执行工具。公开 `/v1/chat/completions` 不增加自定义 status 事件。
+
 Qwen 模型、`mmproj-F16.gguf`、`llama-server` 和运行信息存于私有 Dataset `job579/qwen3-8-27b-unsloth-q4-runtime`；Ornith 模型、配套 mmproj 和固定来源清单存于 `job579/ornith-1-5-35b-a3b-q4-runtime`。专用 Runtime 按固定顺序同时挂载两套 Dataset，HTTP 调用方不能增删或替换；未加载的 Dataset 只作为只读 Input，不占模型 RAM/显存。Worker 始终从 Qwen Runtime Dataset 取得已验证 `llama-server`，再按 preset 从对应 Dataset 发现模型资产。固定 manifest 校验文件名、大小、来源提交和 SHA-256 声明；稳定 Qwen、Qwen MTP 视觉实验和 Ornith 视觉预设加载各自配套投影，Qwen MTP 纯文本与 Ornith 高速文本预设只加载主模型。手动 Worker 与托管 Runtime 都在连续空闲 8 分钟（没有推理或模型操作任务）后自行停止模型并退出，总时长上限 3 小时；Runtime Notebook 不覆盖 Worker 的空闲时限。不发送伪造活动规避配额。
 
 配额页只调用 Kaggle v2.2.5 官方公开命令：`kaggle quota --format json` 查询 GPU/TPU，`kaggle benchmarks quota --format json` 查询 Daily/Monthly AI Models。查询有 15 秒超时和 60 秒进程内缓存，可部分成功。Private Datasets / Private Models 存储配额没有官方公开接口，因此不抓登录页私有 XHR，也不生成估算值。

@@ -292,6 +292,155 @@ def test_queue_lease_single_worker_no_duplicate(instance):
     assert claim(c, cfg).json()["job"] is None
 
 
+def enable_two_slot_worker(client, config):
+    saved = client.put("/api/settings", json={"llama_parallel": 2},
+                       headers={"Origin": "http://testserver"})
+    assert saved.status_code == 200
+    assert heartbeat(client, config, model={"name": "test-model", "status": "ready", "parallel": 2},
+                     capabilities=["llama_cpp", "strata"]).status_code == 200
+
+
+def test_parallel_setting_requires_explicit_model_switch(instance):
+    c, cfg, app = instance
+    setup(c, cfg)
+    assert c.get("/api/settings").json()["settings"]["llama_parallel"] == 1
+    for invalid in (0, 3, "2"):
+        assert c.put("/api/settings", json={"llama_parallel": invalid},
+                     headers={"Origin": "http://testserver"}).status_code == 422
+    heartbeat(c, cfg, capabilities=["llama_cpp", "strata"])
+    changed = c.put("/api/settings", json={"llama_parallel": 2},
+                    headers={"Origin": "http://testserver"})
+    assert changed.status_code == 200
+    assert c.get("/api/runtime").json()["state"] == "model_switch_required"
+    assert c.get("/v1/models", headers={"Authorization": "Bearer " + post_admin(c, "/api/keys", {"name": "parallel"}).json()["key"]}).json()["data"] == []
+    assert post_admin(c, "/api/chat", {"messages": [{"role": "user", "content": "hello"}]}).status_code == 503
+    queued = post_admin(c, "/api/agent/command", {"action": "switch_model"})
+    assert queued.status_code == 200
+    switch = claim(c, cfg).json()["job"]
+    assert switch["payload"]["action"] == "switch_model"
+    assert switch["payload"]["settings"]["llama_parallel"] == 2
+    assert finish(c, cfg, switch, result={"message": "模型切换完成"}).status_code == 200
+    heartbeat(c, cfg, model={"name": "test-model", "status": "ready", "parallel": 2})
+    assert c.get("/api/runtime").json()["state"] == "ready"
+    assert post_admin(c, "/api/chat", {"messages": [{"role": "user", "content": "hello"}]}).status_code == 200
+
+
+def test_concurrent_claims_lease_two_chats_without_crossing_streams(instance):
+    c, cfg, app = instance
+    setup(c, cfg)
+    enable_two_slot_worker(c, cfg)
+    queued = [post_admin(c, "/api/chat", {"messages": [{"role": "user", "content": text}]}).json()["job_id"]
+              for text in ("title", "body", "later")]
+    barrier = threading.Barrier(3)
+    replies = []
+
+    def simultaneous_claim():
+        barrier.wait(3)
+        response = claim(c, cfg)
+        replies.append((response.status_code, response.json()))
+
+    threads = [threading.Thread(target=simultaneous_claim) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+        assert not thread.is_alive()
+    assert len(replies) == 3 and all(status == 200 for status, _ in replies)
+    jobs = [body["job"] for _, body in replies if body["job"]]
+    assert len(jobs) == 2 and {job["id"] for job in jobs} == set(queued[:2])
+    for index, job in enumerate(jobs):
+        chunk = {"choices": [{"index": 0, "delta": {"reasoning_content": f"think-{index}"}}]}
+        assert upload_chunks(c, cfg, job, 0, [chunk]).status_code == 200
+        assert upload_chunks(c, cfg, job, 1, [chunk], token=jobs[1 - index]["lease_token"]).status_code == 403
+    with sqlite3.connect(app.state.db_path) as db:
+        for index, job in enumerate(jobs):
+            raw = db.execute("SELECT payload FROM job_stream_batches WHERE job_id=?", (job["id"],)).fetchone()[0]
+            assert json.loads(raw)[0]["choices"][0]["delta"]["reasoning_content"] == f"think-{index}"
+    assert finish(c, cfg, jobs[0]).status_code == 200
+    assert claim(c, cfg).json()["job"]["id"] == queued[2]
+
+
+@pytest.mark.parametrize("backend,parallel", [("llama_cpp", None), ("strata", 2)])
+def test_legacy_worker_and_strata_keep_one_running_chat(instance, backend, parallel):
+    c, cfg, app = instance
+    setup(c, cfg)
+    if backend == "strata":
+        assert c.put("/api/settings", json={"backend": "strata", "llama_parallel": 2},
+                     headers={"Origin": "http://testserver"}).status_code == 200
+    model = {"name": "test-model", "status": "ready", "backend": backend}
+    if parallel is not None:
+        model["parallel"] = parallel
+    heartbeat(c, cfg, model=model)
+    for text in ("title", "body"):
+        assert post_admin(c, "/api/chat", {"messages": [{"role": "user", "content": text}]}).status_code == 200
+    first = claim(c, cfg).json()["job"]
+    assert first and claim(c, cfg).json()["job"] is None
+    assert finish(c, cfg, first).status_code == 200
+    assert claim(c, cfg).json()["job"] is not None
+
+
+def test_model_command_waits_for_both_running_chats(instance):
+    c, cfg, app = instance
+    setup(c, cfg)
+    enable_two_slot_worker(c, cfg)
+    for text in ("title", "body"):
+        assert post_admin(c, "/api/chat", {"messages": [{"role": "user", "content": text}]}).status_code == 200
+    first, second = claim(c, cfg).json()["job"], claim(c, cfg).json()["job"]
+    command_id = post_admin(c, "/api/agent/command", {"action": "stop_model"}).json()["job_id"]
+    assert post_admin(c, "/api/chat", {"messages": [{"role": "user", "content": "later"}]}).status_code == 503
+    assert claim(c, cfg).json()["job"] is None
+    finish(c, cfg, first)
+    assert claim(c, cfg).json()["job"] is None
+    finish(c, cfg, second)
+    command = claim(c, cfg).json()["job"]
+    assert command["id"] == command_id and command["type"] == "command"
+    # A second control command cannot run alongside the first one.
+    assert post_admin(c, "/api/agent/command", {"action": "stop_model"}).status_code == 200
+    assert claim(c, cfg).json()["job"] is None
+
+
+def test_expired_inference_keeps_its_slot_until_cancel_ack(instance):
+    c, cfg, app = instance
+    setup(c, cfg)
+    enable_two_slot_worker(c, cfg)
+    ids = [post_admin(c, "/api/chat", {"messages": [{"role": "user", "content": text}]}).json()["job_id"]
+           for text in ("title", "body", "later")]
+    first, second = claim(c, cfg).json()["job"], claim(c, cfg).json()["job"]
+    with sqlite3.connect(app.state.db_path) as db:
+        db.execute("UPDATE jobs SET expires_at=? WHERE id=?", (time.time() - 1, first["id"]))
+    assert claim(c, cfg).json()["job"] is None
+    cancel = heartbeat(c, cfg, model={"name": "test-model", "status": "ready", "parallel": 2}).json()
+    assert cancel["cancel_job_ids"] == [first["id"]] and cancel["cancel_job_id"] == first["id"]
+    assert c.get("/api/jobs/" + second["id"]).json()["status"] == "running"
+    acknowledged = finish(c, cfg, first, status="cancelled")
+    assert acknowledged.status_code == 200 and acknowledged.json()["status"] == "expired"
+    assert claim(c, cfg).json()["job"]["id"] == ids[2]
+
+
+def test_heartbeat_delivers_both_cancels_and_acknowledges_independently(instance):
+    c, cfg, app = instance
+    setup(c, cfg)
+    enable_two_slot_worker(c, cfg)
+    for text in ("title", "body"):
+        post_admin(c, "/api/chat", {"messages": [{"role": "user", "content": text}]})
+    first, second = claim(c, cfg).json()["job"], claim(c, cfg).json()["job"]
+    now = time.time()
+    with sqlite3.connect(app.state.db_path) as db:
+        for index, job in enumerate((first, second)):
+            db.execute("UPDATE jobs SET cancel_requested_at=?,cancel_reason=? WHERE id=?",
+                       (now + index, "调用方已断开连接", job["id"]))
+    reply = heartbeat(c, cfg, model={"name": "test-model", "status": "ready", "parallel": 2}).json()
+    assert reply["cancel_job_ids"] == [first["id"], second["id"]]
+    assert reply["cancel_job_id"] == first["id"]
+    assert finish(c, cfg, first).status_code == 200
+    assert c.get("/api/jobs/" + first["id"]).json()["status"] == "cancelled"
+    remaining = heartbeat(c, cfg, model={"name": "test-model", "status": "ready", "parallel": 2}).json()
+    assert remaining["cancel_job_ids"] == [second["id"]] and remaining["cancel_job_id"] == second["id"]
+    assert upload_chunks(c, cfg, second, 0, [{"choices": []}]).json()["cancel_requested"] is True
+    finish(c, cfg, second, status="cancelled")
+    assert heartbeat(c, cfg, model={"name": "test-model", "status": "ready", "parallel": 2}).json()["cancel_job_ids"] == []
+
+
 def test_offline_during_job_and_stale_takeover(instance):
     c, cfg, app = instance
     setup(c, cfg)

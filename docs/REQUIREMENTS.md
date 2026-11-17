@@ -34,6 +34,10 @@
 
 ## 当前模型主线
 
+2026-11-16 补充：用户实际使用 OpenCode，要求排查长思考不实时显示及标题/正文排队，愿意优先使用约 128K。新增可选 1/2 路 llama.cpp 聊天并发，默认 1；并发不增加既有总 KV 预算，双槽每路约为总上下文的一半。显示开关、客户端路由、真实 SSE 和 GPU 解码/显存分别验证，不能混为已完成真机验收。
+
+2026-11-16 最终确认：启用双路，现有上下文、模型预设、KV、Batch、OpenCode 配置和思考偏好保持原样，不为此启动 Kaggle GPU。生产只将并发保存为 2，总窗口仍为 130048，固定分槽后每条约 65024；已向用户说明单条也受每槽上限限制。需区分两个独立 API 请求的并发与 OpenCode 同一会话忙时的消息调度。
+
 当前稳定默认是私有 Dataset `job579/qwen3-8-27b-unsloth-q4-runtime` 中的 Unsloth `Qwen3.8-27B-UD-Q4_K_M`，GGUF 16,564,259,744 bytes，并配套 `mmproj-F16.gguf` 927,607,488 bytes；使用 `llama.cpp`、双 T4、Q8 KV、显式双卡切分。128K 与 256K 均已在 Notebook 本机 API 实测，管理站默认 128K；0.6.0 已完成公开 API 真实图片识别。
 
 0.8.0 增加 `qwen38_27b_mtp` 固定实验预设。生产主 GGUF 已确认自带 `nextn_predict_layers=1` 和完整 `blk.64.nextn.*` 张量，固定 llama.cpp 可在不传 `-md` 的情况下直接创建 MTP context；n=2 真机已确认接受率非零且从约 13.9 tok/s 提升到约 18.78–22.08 tok/s。0.8.1 另增隔离的 `qwen38_27b_mtp_vision` 与配套 mmproj；n=4 现场验收虽识图正确且进程稳定，但 400-token 长输出只有 18.06 tok/s，因此最终也固定 n=2。

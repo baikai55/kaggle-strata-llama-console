@@ -233,6 +233,7 @@ code,pre{font-family:'SFMono-Regular',Consolas,'Liberation Mono',monospace;lette
 .message-heading span{font-size:9px;color:var(--subtle)}
 .message-body{font-size:12px;line-height:1.9;white-space:pre-wrap;overflow-wrap:anywhere;color:#2c3a4b}
 .message-body.error{color:var(--danger)}
+.message-interrupted{font-size:11px;color:var(--danger);margin-top:10px}
 .message-reasoning{margin:0 0 12px;border-left:2px solid var(--accent-border);padding-left:12px;color:var(--muted);white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px}
 .message-reasoning summary{cursor:pointer;color:var(--accent);font-size:10px;margin-bottom:5px}
 .message-image-gallery{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 10px}

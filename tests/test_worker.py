@@ -119,7 +119,7 @@ def test_prepare_llama_autodiscovers_verified_inputs_and_keeps_key_out_of_argv(t
     assert cmd[cmd.index("--ubatch-size") + 1] == "64"
     assert cmd[cmd.index("--port") + 1] == "19090"
     assert "--spec-type" not in cmd
-    assert info == {"alias": "qwen3.8-27b", "context": 131072, "vision": True,
+    assert info == {"alias": "qwen3.8-27b", "context": 131072, "context_total": 131072, "parallel": 1, "vision": True,
                     "preset": "qwen38_27b"}
     assert cwd == runtime and env["CUDA_VISIBLE_DEVICES"] == "0,1"
     # --api-key reads LLAMA_API_KEY; the LLAMA_ARG_ spelling is ignored by
@@ -137,7 +137,7 @@ def test_prepare_llama_autodiscovers_verified_inputs_and_keeps_key_out_of_argv(t
     assert mtp_cmd[mtp_cmd.index("--spec-draft-n-max") + 1] == "2"
     assert "-md" not in mtp_cmd and "--spec-draft-model" not in mtp_cmd
     assert "--mmproj" not in mtp_cmd
-    assert mtp_info == {"alias": "qwen3.8-27b", "context": 131072,
+    assert mtp_info == {"alias": "qwen3.8-27b", "context": 131072, "context_total": 131072, "parallel": 1,
                         "vision": False, "preset": "qwen38_27b_mtp",
                         "speculative": "draft-mtp", "spec_draft_n_max": 2}
 
@@ -150,7 +150,7 @@ def test_prepare_llama_autodiscovers_verified_inputs_and_keeps_key_out_of_argv(t
     assert mtp_vision_cmd[mtp_vision_cmd.index("--spec-draft-n-max") + 1] == "2"
     assert mtp_vision_cmd[mtp_vision_cmd.index("--mmproj") + 1] == str(mmproj)
     assert "-md" not in mtp_vision_cmd and "--spec-draft-model" not in mtp_vision_cmd
-    assert mtp_vision_info == {"alias": "qwen3.8-27b", "context": 131072,
+    assert mtp_vision_info == {"alias": "qwen3.8-27b", "context": 131072, "context_total": 131072, "parallel": 1,
                                "vision": True, "preset": "qwen38_27b_mtp_vision",
                                "speculative": "draft-mtp", "spec_draft_n_max": 2}
 
@@ -158,6 +158,42 @@ def test_prepare_llama_autodiscovers_verified_inputs_and_keeps_key_out_of_argv(t
         prepare_llama(
             {"llama_preset": "qwen38_27b_mtp", "llama_mmproj_path": str(mmproj)},
             runtime / "mtp-vision-worker", "local-model-secret", [mounted])
+
+
+def test_prepare_llama_parallel_reserves_two_slots_without_doubling_kv(tmp_path):
+    mounted = tmp_path / "mounted"
+    mounted.mkdir()
+    (mounted / "Qwen3.8-27B-UD-Q4_K_M.gguf").write_bytes(b"GGUFmodel")
+    (mounted / "llama-server").write_bytes(b"\x7fELFbinary")
+    settings = {"llama_preset": "qwen38_27b_fast", "llama_context_length": 131072,
+                "llama_parallel": 2, "llama_kv_type": "f16"}
+    cmd, _, _, info = prepare_llama(settings, tmp_path / "runtime", "local-key", [mounted])
+    assert cmd[cmd.index("--parallel") + 1] == "2"
+    assert cmd[cmd.index("--ctx-size") + 1] == "131072"
+    assert "--no-kv-unified" in cmd and "--kv-unified" not in cmd
+    assert (info["parallel"], info["context"], info["context_total"]) == (2, 65536, 131072)
+    for parallel in (0, 3):
+        with pytest.raises(WorkerError, match="并发请求数"):
+            prepare_llama(dict(settings, llama_parallel=parallel), tmp_path / "bad", "local-key", [mounted])
+    with pytest.raises(WorkerError, match="整除"):
+        prepare_llama(dict(settings, llama_context_length=131073), tmp_path / "odd", "local-key", [mounted])
+
+
+def test_parallel_readiness_requires_matching_real_slots():
+    worker = Worker("https://example.com", "x" * 32)
+    class Session:
+        def __init__(self, slots):
+            self.slots = slots
+        def get(self, *args, **kwargs):
+            return type("Reply", (), {"json": lambda _: self.slots})()
+    assert worker.verify_parallel_slots(Session([{"n_ctx": 65536}, {"n_ctx": 65536}]), 2) == 65536
+    for slots in ([{"n_ctx": 65536}], [{"n_ctx": 65536}, {"n_ctx": 102400}], [{"n_ctx": 0}, {"n_ctx": 0}]):
+        with pytest.raises(WorkerError, match="未确认两路"):
+            worker.verify_parallel_slots(Session(slots), 2)
+    worker.model["parallel"] = 2
+    assert not worker.speculative_loaded(Session([{"speculative": True}]))
+    assert not worker.speculative_loaded(Session([{"speculative": True}, {"speculative": False}]))
+    assert worker.speculative_loaded(Session([{"speculative": True}, {"speculative": True}]))
 
 
 def test_prepare_llama_fast_presets_use_tensor_split_and_per_kv_limits(tmp_path, monkeypatch):
@@ -186,7 +222,7 @@ def test_prepare_llama_fast_presets_use_tensor_split_and_per_kv_limits(tmp_path,
     assert cmd[cmd.index("--spec-ngram-mod-n-min") + 1] == "12"
     assert cmd[cmd.index("--spec-ngram-mod-n-max") + 1] == "32"
     assert "--mmproj" not in cmd
-    assert info == {"alias": "qwen3.8-27b", "context": 180224, "vision": False,
+    assert info == {"alias": "qwen3.8-27b", "context": 180224, "context_total": 180224, "parallel": 1, "vision": False,
                     "preset": "qwen38_27b_fast", "split_mode": "tensor", "kv_type": "f16",
                     "speculative": "draft-mtp,ngram-mod", "spec_draft_n_max": 2}
     assert env["LLAMA_API_KEY"] == "local-model-secret" and "LLAMA_ARG_API_KEY" not in env
@@ -401,7 +437,7 @@ def test_prepare_llama_ornith_uses_its_assets_and_qwen_runtime(tmp_path, monkeyp
     assert cmd[cmd.index("--model") + 1] == str(model)
     assert "--mmproj" not in cmd
     assert (tmp_path / "worker/llama-runtime/llama-server").read_bytes() == server.read_bytes()
-    assert info == {"alias": "ornith-1.5-35b-a3b", "context": 131072,
+    assert info == {"alias": "ornith-1.5-35b-a3b", "context": 131072, "context_total": 131072, "parallel": 1,
                     "vision": False, "preset": "ornith_35b_a3b"}
     assert hashed == []
 
@@ -409,7 +445,7 @@ def test_prepare_llama_ornith_uses_its_assets_and_qwen_runtime(tmp_path, monkeyp
         {"llama_preset": "ornith_35b_a3b_vision"},
         tmp_path / "worker-vision", "key")
     assert cmd[cmd.index("--mmproj") + 1] == str(mmproj)
-    assert info == {"alias": "ornith-1.5-35b-a3b", "context": 131072,
+    assert info == {"alias": "ornith-1.5-35b-a3b", "context": 131072, "context_total": 131072, "parallel": 1,
                     "vision": True, "preset": "ornith_35b_a3b_vision"}
     assert hashed == [mmproj]
 
@@ -698,8 +734,7 @@ def test_llama_chat_streams_batches_and_rebuilds_result(monkeypatch):
     job = {"id": "job-stream", "lease_token": "lease", "type": "chat",
            "payload": {"messages": [{"role": "user", "content": "hello"}], "stream": False}}
     with worker.active_lock:
-        worker.active_job = job["id"]
-        worker.active_cancel_event = threading.Event()
+        worker.active_jobs[job["id"]] = {"cancel_event": threading.Event()}
     result = worker.perform(job, time.monotonic() + 5)
     config = json.loads(bytes(transport.stdin.data).decode("utf-8"))
     assert config["payload"]["stream"] is True
@@ -758,8 +793,7 @@ def test_stream_batch_window_restarts_after_slow_upload(monkeypatch):
     job = {"id": "job-slow-upload", "lease_token": "lease", "type": "chat",
            "payload": {"messages": [{"role": "user", "content": "hello"}]}}
     with worker.active_lock:
-        worker.active_job = job["id"]
-        worker.active_cancel_event = threading.Event()
+        worker.active_jobs[job["id"]] = {"cancel_event": threading.Event()}
     result = worker.perform(job, time.monotonic() + 5)
     assert uploads == [1, 9]
     assert result["choices"][0]["message"]["content"] == "x" * 10
@@ -772,11 +806,8 @@ def test_heartbeat_cancel_closes_only_active_inference(monkeypatch):
     model_session = FakeSession()
     transport = FakeStreamTransport([], running=True)
     with worker.active_lock:
-        worker.active_job = "job-active"
-        worker.active_cancel_event = cancel_event
-        worker.active_model_response = response
-        worker.active_model_session = model_session
-        worker.active_model_transport = transport
+        worker.active_jobs["job-active"] = {"cancel_event": cancel_event, "response": response,
+                                           "session": model_session, "transport": transport}
     session = FakeSession()
     monkeypatch.setattr(worker, "session", lambda: session)
     monkeypatch.setattr(worker, "refresh_model", lambda: None)
@@ -796,10 +827,8 @@ def test_chunk_upload_cancel_response_interrupts_model_stream(monkeypatch):
     response = FakeStreamResponse([])
     model_session = FakeSession()
     with worker.active_lock:
-        worker.active_job = "job-active"
-        worker.active_cancel_event = cancel_event
-        worker.active_model_response = response
-        worker.active_model_session = model_session
+        worker.active_jobs["job-active"] = {"cancel_event": cancel_event, "response": response,
+                                           "session": model_session}
     monkeypatch.setattr(worker, "request", lambda *args, **kwargs: {"ok": True, "cancel_requested": True})
     with pytest.raises(JobCancelled, match="取消"):
         worker.upload_stream_batch(FakeSession(), {"id": "job-active", "lease_token": "lease"}, 0,
@@ -813,7 +842,7 @@ def test_cancelled_job_reports_cancelled_without_stopping_worker(monkeypatch):
     def cancellable(job, deadline):
         while True:
             with worker.active_lock:
-                event = worker.active_cancel_event
+                event = worker.active_jobs[job["id"]]["cancel_event"]
             if event is not None and event.wait(1):
                 raise JobCancelled("调用方已断开连接，推理已取消")
     monkeypatch.setattr(worker, "perform", cancellable)
@@ -824,7 +853,7 @@ def test_cancelled_job_reports_cancelled_without_stopping_worker(monkeypatch):
                         "expires_at": time.time() + 10}, None)
     canceller.join(1)
     assert reports[0]["status"] == "cancelled" and "断开" in reports[0]["error"]
-    assert not worker.stop_event.is_set() and worker.active_job is None
+    assert not worker.stop_event.is_set() and not worker.active_jobs
 
 
 def test_job_wall_deadline_stops_model_without_replay(monkeypatch):

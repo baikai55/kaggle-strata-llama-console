@@ -37,7 +37,7 @@ from app.kaggle_runtime import KaggleRuntimeClient, KaggleRuntimeError
 
 ROOT = Path(__file__).resolve().parent.parent
 SESSION_COOKIE = "strata_session"
-VERSION = "0.9.6"
+VERSION = "0.9.8"
 WORKER_TTL = 45
 JOB_TIMEOUT = 1800
 MAX_BODY = 4 * 1024 * 1024
@@ -197,7 +197,7 @@ DEFAULT_SETTINGS = {"public_url": "", "backend": "llama_cpp", "auto_load": False
                     "llama_preset": "qwen38_27b",
                     "llama_alias": "qwen3.8-27b",
                     "llama_context_length": 131072, "llama_kv_type": "q8_0", "llama_batch_size": 0,
-                    "llama_ubatch_size": 0, "llama_tensor_split": "1,1"}
+                    "llama_ubatch_size": 0, "llama_tensor_split": "1,1", "llama_parallel": 1}
 
 
 @dataclass
@@ -284,6 +284,7 @@ class Settings(StrictModel):
     llama_batch_size: int | None = Field(default=None, ge=0, le=2048)
     llama_ubatch_size: int | None = Field(default=None, ge=0, le=2048)
     llama_tensor_split: str | None = Field(default=None, pattern=r"^\d{1,3}(\.\d{1,3})?,\d{1,3}(\.\d{1,3})?$")
+    llama_parallel: Literal[1, 2] | None = None
 
     @field_validator("public_url")
     @classmethod
@@ -829,6 +830,10 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             return model.get("backend") in (None, backend)
         target = config.get("llama_preset", "qwen38_27b")
         if model.get("backend") != "llama_cpp" or worker_model_preset(worker) != target:
+            return False
+        # Older workers only have one slot. Changing the configured slot count
+        # requires an explicit model switch before accepting new requests.
+        if model.get("parallel", 1) != config.get("llama_parallel", 1):
             return False
         spec_requirements = {
             "qwen38_27b_mtp": (False, "draft-mtp", 2),
@@ -1507,6 +1512,7 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             config = settings(c)
             old_backend = config.get("backend", "llama_cpp")
             old_preset = config.get("llama_preset", "qwen38_27b")
+            old_parallel = config.get("llama_parallel", 1)
             old_option = preset_option_id(old_preset, config.get("llama_kv_type"))
             new_backend = patch.get("backend", old_backend)
             new_preset = patch.get("llama_preset", old_preset)
@@ -1535,6 +1541,8 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                 patch["llama_model_path"] = ""
                 patch["llama_mmproj_path"] = ""
             config.update(patch)
+            if config["llama_context_length"] % config.get("llama_parallel", 1):
+                raise HTTPException(422, "总上下文长度必须能被并发请求数整除")
             if config.get("llama_preset") == "qwen38_27b_mtp" and config.get("llama_mmproj_path"):
                 raise HTTPException(422, "Qwen MTP 纯文本预设不加载视觉投影；请使用 Qwen MTP 视觉或稳定 Qwen 预设")
             if config.get("llama_preset") == "qwen38_27b_fast" and config.get("llama_mmproj_path"):
@@ -1555,7 +1563,8 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                 raise HTTPException(422, "ubatch 不能大于 batch")
             c.execute("UPDATE settings SET value=? WHERE id=1", (json.dumps(config),))
             new_option = preset_option_id(config["llama_preset"], config["llama_kv_type"])
-            target_changed = new_backend != old_backend or new_option != old_option
+            target_changed = (new_backend != old_backend or new_option != old_option
+                              or config.get("llama_parallel", 1) != old_parallel)
             worker = current_worker(c)
             runtime = runtime_row(c)
             if (target_changed and ready(worker) and not has_model_command(c)
@@ -1936,6 +1945,21 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
     def get_job(job_id: str):
         return read_job(job_id)
 
+    @api.get("/api/jobs/{job_id}/stream", dependencies=[Depends(admin)])
+    async def console_job_stream(job_id: str, request: Request):
+        item = read_job(job_id)
+        if item["type"] != "chat":
+            raise HTTPException(409, "只有聊天任务支持实时输出")
+        return job_stream(job_id, request, "strata", include_usage=True, report_status=True)
+
+    @api.post("/api/jobs/{job_id}/cancel", dependencies=[Depends(admin)])
+    def cancel_console_job(job_id: str):
+        item = read_job(job_id)
+        if item["type"] != "chat":
+            raise HTTPException(409, "只有聊天任务可以在这里取消")
+        request_job_cancel(job_id, "管理员已停止生成")
+        return {"ok": True}
+
     @api.post("/worker/bootstrap")
     def bootstrap_worker(body: RuntimeBootstrap):
         now = time.time()
@@ -2045,10 +2069,12 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                     log(c, "新 Worker 不支持已选择的运行后端，已跳过自动加载", "warning")
                     c.execute("UPDATE runtime_state SET state='failed',error=?,updated_at=? WHERE id=1",
                               ("新 Worker 不支持已选择的运行后端", now))
-            cancel = c.execute("SELECT id,cancel_reason FROM jobs WHERE worker_id=? AND cancel_requested_at IS NOT NULL "
-                               "AND status IN ('running','expired') ORDER BY cancel_requested_at LIMIT 1",
-                               (body.worker_id,)).fetchone()
+            cancels = c.execute("SELECT id,cancel_reason FROM jobs WHERE worker_id=? AND cancel_requested_at IS NOT NULL "
+                                "AND status IN ('running','expired') ORDER BY cancel_requested_at,rowid",
+                                (body.worker_id,)).fetchall()
+            cancel = cancels[0] if cancels else None
         return {"ok": True, "settings": config, "lease_seconds": cfg.job_timeout,
+                "cancel_job_ids": [row["id"] for row in cancels],
                 "cancel_job_id": cancel["id"] if cancel else None,
                 "cancel_reason": cancel["cancel_reason"] if cancel else None}
 
@@ -2060,10 +2086,24 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
             worker = current_worker(c)
             if not online(worker) or worker["worker_id"] != worker_id:
                 raise HTTPException(409, "Worker 会话已失效，请先发送心跳")
-            if c.execute("SELECT id FROM jobs WHERE status='running'").fetchone():
-                return {"job": None}
-            row = c.execute("SELECT * FROM jobs WHERE status='pending' AND worker_id=? ORDER BY created_at LIMIT 1", (worker_id,)).fetchone()
+            # Expiry requests cancellation but does not mean the model stopped.
+            # Keep the leased slot occupied until the worker acknowledges it.
+            # Old sessions' expired leases never block a replacement worker.
+            active = c.execute("SELECT type FROM jobs WHERE worker_id=? AND "
+                               "(status='running' OR (status='expired' AND lease_hash IS NOT NULL))",
+                               (worker_id,)).fetchall()
+            row = c.execute("SELECT * FROM jobs WHERE status='pending' AND worker_id=? ORDER BY created_at,rowid LIMIT 1", (worker_id,)).fetchone()
             if not row:
+                return {"job": None}
+            # Commands form a FIFO barrier: all previous chats must finish,
+            # and no later chat may run across a model load/switch/stop.
+            if any(item["type"] != "chat" for item in active) or (row["type"] != "chat" and active):
+                return {"job": None}
+            model = worker.get("model") or {}
+            config = settings(c)
+            capacity = (2 if model.get("backend") == "llama_cpp" and model.get("parallel") == 2
+                        and config.get("backend") == "llama_cpp" and config.get("llama_parallel", 1) == 2 else 1)
+            if len(active) >= capacity:
                 return {"job": None}
             token = secrets.token_urlsafe(32)
             started_at = time.time()
@@ -2206,14 +2246,18 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                 raise HTTPException(status_code, item["error"] or "推理失败")
             return item["result"]
 
+        return job_stream(job_id, request, body.model,
+                          include_usage=bool((body.stream_options or {}).get("include_usage")))
+
+    def job_stream(job_id, request, model, *, include_usage=False, report_status=False):
         async def events():
             last_seq = -1
             last_emit = time.monotonic()
             saw_worker_chunk = False
             terminal = False
-            include_usage = bool((body.stream_options or {}).get("include_usage"))
+            last_status = None
             common = {"id": "chatcmpl-" + job_id, "object": "chat.completion.chunk",
-                      "created": int(time.time()), "model": body.model}
+                      "created": int(time.time()), "model": model}
             try:
                 # A real data event is emitted immediately because some OpenAI
                 # relays discard SSE comments until the first data line.
@@ -2221,6 +2265,9 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                 yield "data: " + json.dumps(bootstrap, ensure_ascii=False) + "\n\n"
                 while True:
                     item, batches = read_stream_state(job_id, last_seq)
+                    if report_status and item["status"] != last_status:
+                        last_status = item["status"]
+                        yield "event: status\ndata: " + json.dumps({"status": last_status}) + "\n\n"
                     for seq, chunks in batches:
                         last_seq = seq
                         for chunk in chunks:
@@ -2242,7 +2289,7 @@ def create_app(config: Config | None = None, *, runtime_client: KaggleRuntimeCli
                             error = {"error": {"message": item["error"] or "推理失败", "type": "worker_error", "code": item["status"]}}
                             yield "data: " + json.dumps(error, ensure_ascii=False) + "\n\n"
                         elif not saw_worker_chunk:
-                            for chunk in result_stream_chunks(item["result"], job_id, body.model, include_usage):
+                            for chunk in result_stream_chunks(item["result"], job_id, model, include_usage):
                                 forwarded = dict(chunk)
                                 forwarded.update(common)
                                 yield "data: " + json.dumps(forwarded, ensure_ascii=False, separators=(",", ":")) + "\n\n"

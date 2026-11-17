@@ -1,6 +1,98 @@
 # 项目状态
 
-更新：2026-11-16，Asia/Hong_Kong。
+更新：2026-11-17，Asia/Hong_Kong。
+
+## Bonsai 2 27B（Q2_0）试用：独立 Smoke 实测，速度不及现有高速预设，未接入（2026-11-17）
+
+### 需求与安排
+
+- 用户想加一个“量化后占用很低、据说能力还提升”的模型，并给了一份由 DeepSeek 写的试用清单（新建独立 Dataset、加 `bonsai_27b_q2` / `bonsai_27b_q2_vision` 两个预设、四项验收）。安排交给本轮决定。用户随后明确：**更看重速度，看能不能提速。**
+- 决定：先跑一次独立的私有 Smoke，通过并确有收益后再建 Dataset、加预设、部署。Smoke 不改生产预设、现有 Dataset 和 Oracle 控制台。
+
+### 事前核查（非 GPU）
+
+- Hugging Face `prism-ml/Ternary-Bonsai-2-27B-gguf`（commit `839bd57023c1558945afea70a74fa83c054f35f9`，公开、不设门槛、Apache-2.0，基座 `Qwen/Qwen3.8-27B`）。`Ternary-Bonsai-2-27B-Q2_0.gguf` 7,626,008,928 B、`…-mmproj-Q8_0.gguf` 629,246,976 B，大小与 SHA-256 均与清单一致。
+- 版本门槛：GitHub compare `b11556...93cf736a` 为 ahead 767 / behind 0，固定版本晚于 Q2_0 的最低要求。
+- 官方模型卡的能力数据（思考模式 14 项平均）：FP16 86.32，现用同级的 UD-Q4_K_XL 85.18，Bonsai 2 为 84.78。分项：知识 79.86 对 85.55，工具调用 74.92 对 Q4 的 75.05，视觉 MMMU-Pro 75.49 对 81.73、OCR Bench 56.88 对 65.45。“能力还提升了”没有依据：文本大致持平略低，视觉明显更低，收益只在体积（7.63 GB 对 16.6 GB）。
+- Kaggle 上没有现成的 Q2_0 副本：`muhammadosama94/ternary-bonsai-2-27b-gguf` 是 PTQ1_0 + mmproj（需要 PrismML fork），其余公开 Dataset 是 PTQ1_0 / PQ2_0 或只有基准文件。Hugging Face 页面的 “Use this model → Kaggle” 只是新开 Notebook 现拉模型，不会把模型存到 Kaggle。
+- 清单在 Step 2 中段被截断（缺少预设其余常量和 Step 3）；本轮没有补写，因为结论是不接入。
+
+### Smoke 实测（私有 Kernel `job579/bonsai2-27b-q2-smoke-2026-11-17`，双 T4，28.7 分钟，GPU 额度 0.49 小时）
+
+- 构建脚本 `work/bonsai-smoke/build_bonsai_smoke_notebook.py`（复用 `work/tps-bench` 的基准单元），推送前用 `work/bonsai-smoke/mock_test.py` 对本地假服务器跑通全流程。结果在 `work/bonsai-smoke/output/`，摘要 `work/bonsai-smoke/summary.txt`（`work/` 不入 Git）。
+- Notebook 内直接从 Hugging Face 固定 commit 下载两个文件，8.26 GB 含完整 SHA-256 校验共 87.3 秒，校验通过。`llama-server` 取自现有私有 Runtime Dataset，`--version` 报告 commit `93cf736`。
+- **功能四项中三项通过**（F16 KV、131072、layer 切分、带视觉）：
+  - 说人话：水池题在 `reasoning_effort=medium` 下答对 44/7，1308 tokens，正常结束，无乱码或重复。固定版本能正确解码 Q2_0。
+  - 工具调用：`get_weather` 一次往返，参数是合法 JSON（`{"city":"上海"}`），拿到工具结果后答出 23°C。这是合成的单工具用例，**没有做真实 OpenCode 任务**。
+  - 视觉：64px、1024px（1054 tokens）红蓝图均答对；262144 窗口下 2048px（4126 tokens）也答对。
+  - 取回测试：4K / 32K / 64K 三个深度的口令都答对。
+- **速度（同一会话对照，短测为 3 条提示加权）：**
+
+  | 配置 | 短测 | 4K 深度 | 32K 深度 | 64K 深度 | 预填充 4K / 32K / 64K | 加载后显存（MiB） |
+  |---|---|---|---|---|---|---|
+  | Bonsai layer + F16 131K（带视觉） | 20.11 | 19.70 | 17.25 | 15.28 | 299 / 250 / 205 | 8,895 + 8,237 |
+  | Qwen 高速（tensor + MTP n=2 + ngram，F16 131K） | 39.11 | 22.87 | 27.57 | 31.86 | 427 / 375 / 317 | 12,597 + 12,597 |
+  | Bonsai 单卡 F16 98K | 13.44 | — | 12.21 | — | — / 238 / — | 13,683 + 105 |
+  | Bonsai layer + F16 262K（带视觉） | 19.45 | — | — | — | — | 13,247 + 12,589 |
+  | Bonsai layer 复测（会话末尾） | 19.65 | — | — | — | — | 8,895 + 8,237 |
+
+  - 单位 tok/s。Qwen 短测分项：推理 28.65、代码 26.60、改写 88.55（ngram 命中）；Bonsai 三项都在 19.8–20.3。不含改写时 Qwen 约 27–29 对 Bonsai 约 20。
+  - 同一道水池题：Bonsai（medium）1308 tokens / 61.5 秒，Qwen（默认）1561 tokens / 63.4 秒，端到端没有变快。
+  - 会话首尾两次 Bonsai 短测 20.11 / 19.65，会话顺序不是差距的原因。
+- **两条提速路径在固定的 stock llama.cpp 上都不可用：**
+  - `--split-mode tensor`：加载时崩溃，`ggml-backend-meta.cpp:1157: GGML_ASSERT(split_state.ne[j] % div == 0)`（带不带 MTP 都一样）。现有高速预设的速度主要来自 tensor 切分。
+  - `--spec-type draft-mtp`：`context type MTP requested but model doesn't contain MTP layers`，服务退出。
+  - 单卡比双卡 layer 切分更慢（13.4 对 20.1），所以“一卡一个实例”也不是提速方案。
+- **确认的坑**（与清单和官方 KNOWN_ISSUES 一致）：`reasoning_effort=high` 返回 HTTP 500（`Unexpected reasoning effort`），`medium` / `xhigh` / `low` / `none` 正常；两条 system 消息、或 system 不在开头，返回 500（Qwen 只在 system 不在开头时 500）。两个模型 `/props` 的默认采样都是 temperature 1.0 / top_k 20 / top_p 0.95 / min_p 0.05。
+- Bonsai 的实际好处：显存占用低，F16 KV 下带视觉可开满 **262144**（2048px 图片时峰值 13,681 MiB）；本地盘加载约 5 秒（Qwen 从 Dataset 加载 74 秒，两者介质不同，不能直接比较）。
+
+### 结论与剩余事项
+
+- **不接入。** 用户优先速度，而 Bonsai 在本环境比现有 `qwen38_27b_fast` 慢约 30%（短输出）到 50%（64K 深度），能力持平略低、视觉更低，且已知的提速手段在 stock 构建上都不可用。没有新建 `job579/bonsai2-27b-q2-runtime` Dataset，没有改 `agent/worker.py` / `app/main.py`，没有部署；生产保持 0.9.8 和已保存的 `qwen38_27b_fast_vision` 设置。
+- 未做：真实 OpenCode 工具调用任务；PrismML fork 构建（PQ2_0 / PTQ1_0 及其 MTP）。社区称 fork 上 T4 的 MTP 提速 19–29%，按本次 20 tok/s 估算仍低于现有预设，且需要另建 Runtime，本轮未验证也不建议投入。
+- 若以后需要“带视觉的 262K F16 窗口、可接受约 20 tok/s”，本次数据可直接作为接入依据；届时需给该预设加 `high`→`xhigh` 映射，并处理多条 system 消息。
+- 私有 Smoke Kernel 保留在 Kaggle 作为证据，未删除。GPU 额度：本周已用 8.91 / 30 小时（2026-11-21 刷新）。
+- 0.9.7 / 0.9.8 的工作区改动仍未提交；`7e4b6af` 仍未推送。
+
+## 本轮 0.9.7 / 0.9.8：OpenCode 思考显示排查、双请求并发（已部署并保存双路，双槽真机验收未做，2026-11-16）
+
+### 用户反馈与排查
+
+- 用户在 OpenCode 中看到长思考期间没有实时内容；新会话标题与正文疑似互相排队。用户愿意优先使用约 128K 上下文，减少资源消耗。
+- 本机 OpenCode 1.18.25 的 `@ai-sdk/openai-compatible` 已把 `reasoning_content` / `reasoning` 转为实时 reasoning delta，处理器立即更新；TUI 默认 `thinking_mode=hide`。输入 `/thinking`（别名 `/toggle-thinking`）可展开，CLI `run` 支持 `--thinking`。未修改用户客户端配置，未验证其当前交互会话的实际显示状态。
+- 全局配置声明的 Qwen 窗口是 128000，输出 32768；`small_model` 已指定免费 DeepSeek，标题应优先走该小模型。项目覆盖或模型回退仍可能改变路由，不能仅凭全局配置认定生产标题占用 Kaggle。缺少 `reasoning:true` 影响模型能力声明，但不是 SDK 接收思考流的开关。
+- 0.5.0 有 Kaggle → Worker → Cloudflare → CPA 的真实 reasoning SSE 验收记录；本轮没有启动 GPU，也没有把该历史证据当作当前 OpenCode 已验证。
+
+### 实现与取舍
+
+- 原串行有三层：网站任意 running 任务阻止再领取，Worker 等一条执行结束才轮询，llama-server 固定 `--parallel 1`。现在增加 `llama_parallel=1|2`（默认 1，旧数据库自动补默认）；只有模型实际报告双槽、设置也为 2 且 backend 为 llama.cpp 时，服务端才允许两条 chat 同时执行。Strata 仍串行。
+- 双槽使用 `--parallel 2 --no-kv-unified`，不把 `--ctx-size` 翻倍。保存的上下文是总量；128K 总量每路约 64K，204800 总量每路 102400。Worker 读取真实 `/slots` 验证独立槽与每槽窗口，并对 MTP 要求所有槽都报告 speculative；心跳区分 `context`（每路）与 `context_total`（总量）。更改并发数需显式重新加载/切换。
+- 开启双槽后，OpenCode 等客户端声明的模型 `limit.context` 若仍按原总窗口管理历史，可能在模型每槽已超限时仍未压缩。用户最终明确只启用双路、不改上下文和客户端配置；已说明总 130048 固定分槽后每路约 65024 tokens，即使只有一条也受该槽窗口限制。OpenCode 原 128000 声明按其要求保持。
+- 固定版本支持 `--kv-unified`，但共享池耗尽会使所有在途 slot 一起失败。因此本轮不开放共享满窗，不承诺两路各 200K 或原单请求 decode 速度。
+- 任务独立线程、HTTP Session、取消事件和桥接进程；取消/单任务到期关闭该请求桥接，保留其他请求及已加载模型。在途控制上传未退出时继续占租约，避免仅因慢上传就停止整个模型。会话到期、失联和停止仍结束全部任务；忙时不会触发空闲停止。
+- 控制命令保持 FIFO 屏障，等待全部已有聊天结束；过期但取消尚未确认的租约继续占槽。心跳同时返回所有 `cancel_job_ids` 并保留旧字段。
+- 顺带修正管理站聊天页：此前轮询最终 result，思考和正文完成后才显示；现在 `/api/jobs/{id}/stream` 逐步显示 reasoning/content/tool_calls/usage 和排队状态，支持取消单条回答，错误保留部分内容并恢复输入。公开 API 复用同一流逻辑，格式不变。API 示例同时 flush 打印思考和正文。
+- 修复心跳健康检查与模型切换的竞态：旧进程的迟到结果不能把新 loading 模型标成 ready/error；最终就绪赋值与停止进程使用同一锁。
+
+### 验证与剩余事项
+
+- 本地测试包括真实 SQLite 队列、管理员 SSE 生成器在任务仍 running 时输出 reasoning、工具/usage/DONE、并发抢租约/取消/到期/控制屏障、Worker 双线程执行与忙时空闲计时；前端 ReadableStream 用 UTF-8 逐字节与 CRLF 拆分验证思考在完成前渲染。
+- 最终全量 **153 passed**（57.36 秒）；`python -m compileall -q app agent tests`、`node --check static/app.js`、JS ReadableStream 行为回归和 `git diff --check` 均通过。本地测试模拟模型事件，不是 GPU 推理实测。
+- **已部署，未提交 Git，未启动 Kaggle。** 双 T4 上双槽的实际显存、MTP 吞吐和当前 OpenCode 端到端显示需下次实际会话验证。不要把双并发标成已真机验收。
+- OpenCode 配置另有 `reasoningEffort=max` variant，当前 Chat 不接受 max；本轮未改该客户端偏好。
+
+### 部署与线上速度核查（2026-11-16）
+
+- 用户追问部署与速度后，已部署 0.9.7，stamp `20261116T185654`（香港时间）。部署前 Worker `stopped`、Runtime `stopped/complete`、无 pending/running，额外通过 SQLite online backup 保存 `/data/release-backups/console-before-20261116T185654.sqlite3`（21,884,928 bytes，完整性 ok）。沿用既有 SSH 传输代理；本轮没有启动/停止该既有代理。
+- 部署与独立后验：15 个宿主文件、12 个容器文件 hash 正确；容器 healthy，原数据卷、管理员/会话/API Key/设置指纹保留，SQLite 完整性 ok，其他 45 个容器与 adapter 服务不变。回滚镜像 `kaggle-strata-console:before-20261116t185654`，源代码和环境备份存于对应 release stage。
+- 公网 `/healthz` 为 0.9.7；新管理员 stream/cancel、status/settings/runtime/models 未登录均 401，错误 API Key 401；首页引用 0.9.7，app.js/styles.css SHA-256 与本地一致。没有启动 Kaggle/GPU。Worker 改动将在下次正常启动时由新 Notebook 使用。
+- 生产保存值是 `qwen38_27b_fast_vision`、F16、总上下文 **130048**、batch/ubatch 1024/256、tensor 1,1；并发现已保存为 **2**，下次正常启动生效。此前文档所记视觉200K是旧设置，不能把它当成此次实际配置。本轮只修改并发，没有修改窗口、KV、Batch、预设或 OpenCode。
+- 只读最近请求元数据显示，长任务 `9f31cdea` 首输出约 1.75 秒，生成 21,580 tokens 耗 805.30 秒，模型 decode 26.81、交付 26.80 tok/s。其 result 仅统计长度：思考 **45,826 字符**、正文 20 字符、1 条工具调用；没有输出/保存正文副本。另一任务 `4988ec44` 首输出约 1.40 秒，28,664 tokens 耗 1005.98 秒，decode 28.50、交付 28.49 tok/s。这些十几分钟主要是模型长生成，转发已接近 decode；单纯减少 KV 总窗口不能消除它。
+- 最近短请求成对创建（约499-token与7368-token提示），第二条排队约5.6–7.4秒，说明双路确有减少同时请求等待的用途；不凭元数据认定每条的具体提示或客户端来源。
+- 用户最终确认“启用双路，上下文不用调，只有标题会用到，平时都是一条一条的发”。已通过其登录中的管理页实际保存，页面显示“已保存”及目标“2 路请求”，再用只读数据库核验 `llama_parallel=2`。Runtime `stopped/complete`、Worker stopped、无在途任务；没有启动 Kaggle/GPU。
+- 保存时发现 0.9.7 前端下拉框把并发值序列化为字符串，服务器 `Literal[1,2]` 拒绝；0.9.8 修复为数字。已部署 0.9.8，stamp `20261116T190917`，保留数据库 online backup `/data/release-backups/console-before-20261116T190917.sqlite3` 与回滚镜像 `kaggle-strata-console:before-20261116t190917`。独立后验确认容器 healthy、12 个容器源码 hash 匹配、原数据卷与 SQLite 完整性正常，其他 45 个容器和 adapter 服务保持；公网鉴权、首页版本和静态资源 hash 复核通过。
+- 服务端双路表示第二个独立 HTTP 聊天请求可与第一条同时处理，两槽占满后新增请求才等待；不会自动补入第一条尚未完成的回答。只读核查本机 OpenCode 1.18.25 确认：普通 TUI 忙时提交会保存新 user message，但 `SessionPrompt.loop` 按 sessionID 复用 `SessionRunState.ensureRunning` 中的同一个 runner 并等待 `run.done`，不另开第二路模型生成。新消息在该会话的后续处理时读取；标题等独立请求与不同会话才可利用服务器双路。已向用户澄清先前“第二条独立”只指两个独立服务端请求。
+- OpenCode runner 每轮重新读取会话消息，因此当前这轮模型生成结束后即可读入追加消息，并不保证等待整个 Agent 工作链结束；多条追发可能一起进入下一轮上下文，也不保证每条各得到一份独立回复。证据来自本机 `opencode-ai/bin/opencode.exe` 内嵌 `chunk-mzwkkb61.js` 的 SessionPrompt / SessionRunState 与 `chunk-h5tvqtdt.js` 的 TUI submit；仅源码核查，未运行真实模型验证。
 
 ## 本轮 0.9.6：预设下拉自动填充、启动统计页、浅色主题（已部署，生产真机验收未做，2026-11-16）
 

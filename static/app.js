@@ -13,7 +13,7 @@
     const hint = mmprojInput.parentElement && mmprojInput.parentElement.querySelector('small');
     if (hint) hint.textContent = 'Qwen 与 Ornith 视觉预设自动加载配套投影；高速 Ornith 不加载。';
   }
-  const state = { authenticated: false, setup: false, currentView: 'overview', status: null, runtime: null, settings: {}, presets: [], history: [], chatImages: [], chatImageBusy: false, samples: [], logs: [], requests: { summary: {}, rows: [] }, quotas: null, requestPeriod: '7d', requestsBusy: false, launches: { summary: {}, rows: [] }, launchPeriod: '30d', launchesBusy: false, launchesAt: 0, quotasBusy: false, pollBusy: false, chatBusy: false, chatJob: null, commandBusy: false, runtimeBusy: false, pendingAuth: false, connectionFresh: false };
+  const state = { authenticated: false, setup: false, currentView: 'overview', status: null, runtime: null, settings: {}, presets: [], history: [], chatImages: [], chatImageBusy: false, samples: [], logs: [], requests: { summary: {}, rows: [] }, quotas: null, requestPeriod: '7d', requestsBusy: false, launches: { summary: {}, rows: [] }, launchPeriod: '30d', launchesBusy: false, launchesAt: 0, quotasBusy: false, pollBusy: false, chatBusy: false, chatJob: null, chatAbort: null, chatStopping: false, commandBusy: false, runtimeBusy: false, pendingAuth: false, connectionFresh: false };
   const dirtyForms = new Set();
 
   function safeNumber(value) {
@@ -176,7 +176,8 @@
       return !loadedBackend || loadedBackend === selectedBackend;
     }
     return loadedBackend === 'llama_cpp'
-      && loadedOption() === (state.settings.llama_preset_option || 'qwen38_27b');
+      && loadedOption() === (state.settings.llama_preset_option || 'qwen38_27b')
+      && Number(model.parallel || 1) === Number(state.settings.llama_parallel || 1);
   }
   function modelTransitioning() {
     const agent = state.status && state.status.agent;
@@ -191,7 +192,8 @@
     const backendField = $('#model-form') && $('#model-form').elements.namedItem('backend');
     const backend = backendField && backendField.value || state.settings.backend || 'strata';
     const unsaved = dirtyForms.has('model-form');
-    text('#session-target', backend === 'llama_cpp' ? optionLabel(selectedOption()) + (unsaved ? ' · 未保存' : '') : 'Strata');
+    const parallelField = $('#model-form').elements.namedItem('llama_parallel');
+    text('#session-target', backend === 'llama_cpp' ? optionLabel(selectedOption()) + ' · ' + (parallelField.value || 1) + ' 路请求' + (unsaved ? ' · 未保存' : '') : 'Strata');
   }
   function runtimeState(runtime) { return String(runtime && runtime.state || (runtime && runtime.configured ? 'stopped' : 'unconfigured')).toLowerCase(); }
   function modelSwitchRequired() { return runtimeState(state.runtime || state.status && state.status.runtime) === 'model_switch_required'; }
@@ -307,11 +309,15 @@
       button.disabled = state.runtimeBusy || stoppedRequested;
     });
     $('#chat-send-button').disabled = !modelCallable() || transitioning || state.chatBusy;
+    $('#chat-send-button').hidden = state.chatBusy;
+    $('#chat-stop-button').hidden = !state.chatBusy;
+    $('#chat-stop-button').disabled = !state.chatJob || state.chatStopping;
     $('#chat-image-button').disabled = !modelVisionReady() || transitioning || state.chatBusy || state.chatImageBusy;
     $('#clear-chat-button').disabled = state.chatBusy;
     renderModelTarget();
   }
   function showAuth(setup) {
+    if (state.chatAbort) state.chatAbort.abort();
     state.authenticated = false;
     state.connectionFresh = false;
     dirtyForms.clear();
@@ -451,7 +457,7 @@
   }
   function updateSettings(settings) {
     if (!settings) return;
-    state.settings = Object.assign({}, state.settings, settings);
+    state.settings = Object.assign({ llama_parallel: 1 }, state.settings, settings);
     populateForm($('#model-form'), state.settings);
     populateForm($('#settings-form'), state.settings);
     syncBackendForm();
@@ -482,8 +488,13 @@ response = client.chat.completions.create(
 )
 for chunk in response:
     if chunk.choices:
-        print(chunk.choices[0].delta.content or "", end="")
-# 当前服务保持连接，等模型完成后一次返回内容。`;
+        delta = chunk.choices[0].delta
+        reasoning = getattr(delta, "reasoning_content", None)
+        if reasoning:
+            print(reasoning, end="", flush=True)
+        if delta.content:
+            print(delta.content, end="", flush=True)
+# llama.cpp 实时输出思考与回答；Strata 在推理完成后返回。`;
     text('#api-example-code', example);
     renderModelTarget();
   }
@@ -545,30 +556,32 @@ for chunk in response:
     const backend = modelInfo.backend || payload.settings && payload.settings.backend;
     const backendLabel = backend === 'llama_cpp' ? 'llama.cpp' : backend === 'strata' ? 'Strata' : '';
     const loadedContext = safeNumber(modelInfo.context);
+    const loadedTotalContext = safeNumber(modelInfo.context_total) ?? loadedContext;
     const loadedKv = kvLabel(modelInfo.kv_type);
     const speculativeLabel = modelInfo.speculative
       ? (modelInfo.split_mode === 'tensor' ? 'tensor 切分 · ' : '') + 'MTP n=' + (modelInfo.spec_draft_n_max || '—')
         + (String(modelInfo.speculative).includes('ngram-mod') ? ' + ngram' : '')
       : '';
-    const modelDetail = [online ? label : name ? '上次模型 · 代理已离线' : '', backendLabel, speculativeLabel, modelInfo.vision === true ? '视觉已启用' : '', loadedKv, loadedContext === null ? '' : formatNumber(loadedContext) + ' tokens'].filter(Boolean).join(' · ');
+    const parallelLabel = modelInfo.backend === 'llama_cpp' ? (modelInfo.parallel || 1) + ' 路请求' : '';
+    const modelDetail = [online ? label : name ? '上次模型 · 代理已离线' : '', backendLabel, parallelLabel, speculativeLabel, modelInfo.vision === true ? '视觉已启用' : '', loadedKv, loadedContext === null ? '' : formatNumber(loadedContext) + ' tokens' + (Number(modelInfo.parallel || 1) > 1 ? ' / 路' : '')].filter(Boolean).join(' · ');
     text('#metric-model-detail', name ? modelDetail : backendLabel ? '等待 ' + backendLabel + ' 加载' : '连接后显示真实模型');
     const loadedPreset = presetOption(modelInfo.preset);
     const loadedPresetLabel = loadedPreset ? loadedPreset.label : '';
     text('#session-model', name ? name + (loadedPresetLabel && !name.toLowerCase().includes(loadedPresetLabel.toLowerCase()) ? ' · ' + loadedPresetLabel : '') + (backendLabel ? ' · ' + backendLabel : '') + (speculativeLabel ? ' · ' + speculativeLabel : '') + (modelInfo.vision === true ? ' · 视觉' : '') + (loadedKv ? ' · ' + loadedKv : '') : '尚未加载');
-    text('#chat-model-label', name ? name + (speculativeLabel ? ' · ' + speculativeLabel : '') + (modelInfo.vision === true ? ' · 可识图' : ' · 仅文字') : '模型尚未就绪');
+    text('#chat-model-label', name ? name + (speculativeLabel ? ' · ' + speculativeLabel : '') + (parallelLabel ? ' · ' + parallelLabel : '') + (modelInfo.vision === true ? ' · 可识图' : ' · 仅文字') : '模型尚未就绪');
     text('#session-last-seen', agent && agent.last_seen ? formatDate(agent.last_seen, true) : '—');
     // The window is fixed when llama-server starts. Saving another length for
     // the same entry does not reload the model, so say what is really loaded.
     const savedContext = safeNumber(state.settings.llama_context_length);
-    const contextPending = modelCallable() && modelInfo.backend === 'llama_cpp' && loadedContext !== null && savedContext !== null && loadedContext !== savedContext;
+    const contextPending = modelCallable() && modelInfo.backend === 'llama_cpp' && loadedTotalContext !== null && savedContext !== null && loadedTotalContext !== savedContext;
     $('#session-hint').hidden = !contextPending;
-    text('#session-hint', contextPending ? '已保存的上下文是 ' + formatNumber(savedContext) + '，当前加载的仍是 ' + formatNumber(loadedContext) + '。要让新窗口生效，先“停止推理进程”，再“加载所选模型”。' : '');
+    text('#session-hint', contextPending ? '已保存的总上下文是 ' + formatNumber(savedContext) + '，当前加载的仍是 ' + formatNumber(loadedTotalContext) + '。要让新窗口生效，先“停止推理进程”，再“加载所选模型”。' : '');
     const launchElapsed = runtimeElapsed(runtime);
     text('#metric-runtime', agent ? formatDuration(agent.runtime_seconds) : launchElapsed === null ? '—' : formatDuration(launchElapsed));
     text('#metric-runtime-detail', online ? '当前 Kaggle 代理会话' : launching ? runtimeInfo[0] : agent ? '上次会话 · 已离线' : 'Kaggle 会话尚未连接');
     if (loadedContext !== null) {
       text('#metric-context', formatNumber(loadedContext));
-      text('#metric-context-detail', (backendLabel || '模型') + ' 实际加载窗口');
+      text('#metric-context-detail', (backendLabel || '模型') + (Number(modelInfo.parallel || 1) > 1 ? ' 每路窗口 · 总计 ' + formatNumber(loadedTotalContext) : ' 实际加载窗口'));
     }
     if (!state.chatBusy) text('#chat-request-status', modelTransitioning() ? '模型正在加载或切换，请稍候' : modelCallable() ? modelVisionReady() ? '当前页对话 · 可发送文字或图片' : '当前模型未加载视觉投影，仅支持文字' : '连接并加载所选模型后即可发送');
     renderGpus(agent && agent.metrics, online);
@@ -691,7 +704,7 @@ for chunk in response:
     const fields = {};
     Array.from(form.elements).forEach(function (field) {
       if (!field.name) return;
-      fields[field.name] = field.type === 'checkbox' ? field.checked : field.type === 'number' ? Number(field.value) : field.value.trim();
+      fields[field.name] = field.type === 'checkbox' ? field.checked : (field.type === 'number' || field.name === 'llama_parallel') ? Number(field.value) : field.value.trim();
     });
     const submit = $('button[type=submit]', form); submit.disabled = true;
     inlineStatus(feedback, '正在保存…');
@@ -1255,6 +1268,108 @@ for chunk in response:
     if (result.message && typeof result.message === 'object') return result.message;
     return { content: result.content || result.response || result.text || '', reasoning_content: result.reasoning_content, tool_calls: result.tool_calls };
   }
+  function parseChatEvent(frame) {
+    const data = [];
+    let event = 'message';
+    frame.split(/\r?\n/).forEach(function (line) {
+      if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+      else if (line.startsWith('event:')) event = line.slice(6).trim();
+    });
+    return data.length ? { event: event, data: data.join('\n') } : null;
+  }
+  async function readChatStream(jobId, signal, onEvent) {
+    const response = await fetch('/api/jobs/' + encodeURIComponent(jobId) + '/stream', {
+      credentials: 'same-origin', headers: { Accept: 'text/event-stream' }, signal: signal
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(function () { return null; });
+      if (response.status === 401 && state.authenticated) showAuth(false);
+      throw new Error(errorText(payload, '读取回答失败（HTTP ' + response.status + '）'));
+    }
+    if (!response.body || !(response.headers.get('content-type') || '').includes('text/event-stream')) throw new Error('服务没有返回实时回答流');
+    const reader = response.body.getReader(), decoder = new TextDecoder('utf-8', { fatal: true });
+    let buffer = '', complete = false;
+    try {
+      while (true) {
+        const part = await reader.read();
+        buffer += part.done ? decoder.decode() : decoder.decode(part.value, { stream: true });
+        let boundary;
+        while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
+          const frame = buffer.slice(0, boundary.index);
+          buffer = buffer.slice(boundary.index + boundary[0].length);
+          const event = parseChatEvent(frame);
+          if (!event) continue;
+          if (event.data === '[DONE]') { complete = true; return; }
+          const payload = JSON.parse(event.data);
+          if (payload.error) throw new Error(errorText(payload, '模型推理失败'));
+          onEvent(event.event, payload);
+        }
+        if (part.done) throw new Error('回答流提前结束，请检查运行日志');
+      }
+    } finally {
+      // Closing a partial stream also tells the server to cancel this job.
+      if (!complete) await reader.cancel().catch(function () {});
+      reader.releaseLock();
+    }
+  }
+  function accumulateChatChunk(result, chunk) {
+    if (chunk.usage) result.usage = chunk.usage;
+    const choice = (chunk.choices || []).find(function (item) { return (item.index || 0) === 0; });
+    if (!choice) return false;
+    const delta = choice.delta || {}, message = result.choices[0].message;
+    if (typeof delta.content === 'string') message.content += delta.content;
+    const reasoning = delta.reasoning_content ?? delta.reasoning;
+    if (typeof reasoning === 'string') message.reasoning_content += reasoning;
+    if (Array.isArray(delta.tool_calls)) {
+      delta.tool_calls.forEach(function (part) {
+        const index = Number.isInteger(part.index) && part.index >= 0 ? part.index : 0;
+        const tool = message.tool_calls[index] || { id: '', type: 'function', function: { name: '', arguments: '' } };
+        if (typeof part.id === 'string') tool.id += part.id;
+        if (part.type) tool.type = part.type;
+        if (part.function) {
+          if (typeof part.function.name === 'string') tool.function.name += part.function.name;
+          if (typeof part.function.arguments === 'string') tool.function.arguments += part.function.arguments;
+        }
+        message.tool_calls[index] = tool;
+      });
+    }
+    if (choice.finish_reason) result.choices[0].finish_reason = choice.finish_reason;
+    return Boolean(delta.content || reasoning || (delta.tool_calls && delta.tool_calls.length));
+  }
+  function renderChatResponse(responseEl, message, complete) {
+    const reasoning = message.reasoning_content || message.reasoning;
+    if (reasoning) {
+      if (!responseEl.reasoning) {
+        const details = node('details', 'message-reasoning');
+        details.open = true;
+        responseEl.reasoningTitle = node('summary');
+        responseEl.reasoningBody = node('div');
+        details.append(responseEl.reasoningTitle, responseEl.reasoningBody);
+        responseEl.content.insertBefore(details, responseEl.body);
+        responseEl.reasoning = details;
+      }
+      responseEl.reasoningTitle.textContent = complete || message.content ? '模型思考过程' : '模型正在思考…';
+      responseEl.reasoningBody.textContent = typeof reasoning === 'string' ? reasoning : JSON.stringify(reasoning);
+    }
+    let content = typeof message.content === 'string' ? message.content : message.content ? JSON.stringify(message.content, null, 2) : '';
+    if (message.tool_calls && message.tool_calls.length) content += (content ? '\n\n' : '') + '模型请求调用工具：\n' + JSON.stringify(message.tool_calls.filter(Boolean), null, 2) + '\n\n此测试页仅展示请求，不自动执行工具。';
+    if (content || complete) {
+      responseEl.body.className = 'message-body';
+      responseEl.body.textContent = content || (reasoning ? '模型本次仅返回思考过程，没有回答正文。' : '模型返回了空内容，请查看运行日志。');
+    } else if (reasoning) {
+      responseEl.body.replaceChildren(node('span', 'spinner'), node('span', '', '正在思考，回答将实时显示…'));
+    }
+    scrollChat();
+  }
+  async function stopChat() {
+    if (!state.chatJob || state.chatStopping) return;
+    state.chatStopping = true;
+    updateActionAvailability();
+    text('#chat-request-status', '正在停止当前回答…');
+    try { await api('/api/jobs/' + encodeURIComponent(state.chatJob) + '/cancel', { method: 'POST' }); }
+    catch (error) { toast(error.message, 'error'); }
+    finally { if (state.chatAbort) state.chatAbort.abort(); }
+  }
   async function sendChat(event) {
     event.preventDefault();
     if (state.chatBusy || !modelCallable()) return;
@@ -1264,7 +1379,7 @@ for chunk in response:
     if (submittedImages.length && !modelVisionReady()) { toast('当前模型未加载视觉投影，不能发送图片', 'error'); return; }
     const maxTokens = safeNumber($('#chat-max-tokens').value), temperature = safeNumber($('#chat-temperature').value);
     if (maxTokens === null || maxTokens < 1 || maxTokens > 32768 || temperature === null || temperature < 0 || temperature > 2) { toast('请检查最大输出 tokens 和 Temperature', 'error'); return; }
-    state.chatBusy = true; updateActionAvailability();
+    state.chatBusy = true; state.chatStopping = false; updateActionAvailability();
     const content = submittedImages.length ? (prompt ? [{ type: 'text', text: prompt }] : []).concat(submittedImages.map(function (item) { return { type: 'image_url', image_url: { url: item.dataUrl } }; })) : prompt;
     state.history.push({ role: 'user', content: content });
     const userEl = appendMessage('user', prompt, false, submittedImages);
@@ -1273,22 +1388,38 @@ for chunk in response:
     const responseEl = appendMessage('assistant', '', true);
     text('#chat-request-status', '正在提交…');
     let inferenceCompleted = false;
+    const result = { choices: [{ message: { role: 'assistant', content: '', reasoning_content: '', tool_calls: [] } }] };
+    let phase = 'pending', receivedOutput = false;
+    const startedAt = Date.now();
+    function renderProgress() {
+      if (state.chatStopping) return;
+      const message = responseContent(result);
+      const label = message.content ? '正在生成回答' : message.tool_calls.length ? '正在生成工具调用' : message.reasoning_content ? '模型思考中' : phase === 'running' ? '模型处理中，等待首个输出' : '排队中';
+      text('#chat-request-status', label + ' · ' + formatDuration((Date.now() - startedAt) / 1000));
+    }
+    const progressTimer = window.setInterval(renderProgress, 1000);
     try {
       const task = await api('/api/chat', { method: 'POST', body: { messages: state.history.slice(), max_tokens: maxTokens, temperature: temperature } });
       if (!task.job_id) throw new Error('服务没有返回任务 ID。请求不会自动重试，请检查日志。');
       state.chatJob = task.job_id;
-      const result = await waitForJob(task.job_id, function (job, elapsed) { text('#chat-request-status', jobStatus(job.status)[0] + ' · 已等待 ' + formatDuration(elapsed)); });
+      updateActionAvailability();
+      if (!state.authenticated) throw new Error('登录会话已结束');
+      state.chatAbort = new AbortController();
+      await readChatStream(task.job_id, state.chatAbort.signal, function (event, chunk) {
+        if (event === 'status') phase = chunk.status;
+        else if (accumulateChatChunk(result, chunk)) {
+          receivedOutput = true;
+          renderChatResponse(responseEl, responseContent(result), false);
+        }
+        if (chunk.usage) {
+          text('#usage-prompt', formatNumber(chunk.usage.prompt_tokens ?? chunk.usage.input_tokens));
+          text('#usage-completion', formatNumber(chunk.usage.completion_tokens ?? chunk.usage.output_tokens));
+          text('#usage-total', formatNumber(chunk.usage.total_tokens));
+        }
+        renderProgress();
+      });
       const message = responseContent(result);
-      let content = typeof message.content === 'string' ? message.content : message.content ? JSON.stringify(message.content, null, 2) : '';
-      if (message.tool_calls && message.tool_calls.length) content += (content ? '\n\n' : '') + '模型请求调用工具：\n' + JSON.stringify(message.tool_calls, null, 2) + '\n\n此测试页仅展示请求，不自动执行工具。';
-      if (!content) content = '模型返回了空内容，请查看运行日志。';
-      responseEl.body.className = 'message-body'; responseEl.body.textContent = content;
-      const reasoning = message.reasoning_content || message.reasoning;
-      if (reasoning) {
-        const details = node('details', 'message-reasoning');
-        details.append(node('summary', '', '查看模型思考过程'), node('div', '', typeof reasoning === 'string' ? reasoning : JSON.stringify(reasoning)));
-        responseEl.content.insertBefore(details, responseEl.body);
-      }
+      renderChatResponse(responseEl, message, true);
       const saved = { role: 'assistant', content: typeof message.content === 'string' ? message.content : '' };
       if (message.tool_calls && message.tool_calls.length) {
         state.history = state.history.slice(0, -1);
@@ -1301,15 +1432,21 @@ for chunk in response:
       text('#chat-request-status', '回答完成' + (result.usage ? ' · 实际用量见右侧' : ' · 模型未报告用量'));
       inferenceCompleted = true; scrollChat();
     } catch (error) {
+      if (state.chatJob && state.authenticated) {
+        await api('/api/jobs/' + encodeURIComponent(state.chatJob) + '/cancel', { method: 'POST' }).catch(function () {});
+      }
       if (state.history.length && state.history[state.history.length - 1].role === 'user') state.history.pop();
-      userEl.row.remove(); responseEl.row.remove();
+      if (receivedOutput) {
+        renderChatResponse(responseEl, responseContent(result), true);
+        responseEl.content.append(node('p', 'message-interrupted', state.chatStopping ? '已停止。上方是已收到的部分内容。' : '回答未完成：' + error.message));
+      } else { userEl.row.remove(); responseEl.row.remove(); }
       $('#chat-input').value = prompt;
       state.chatImages = submittedImages; renderChatImages();
       $('#chat-welcome').hidden = Boolean($('.chat-message', $('#chat-messages')));
-      text('#chat-request-status', '请求未完成 · ' + error.message);
-      toast('请求未完成，文字和图片已恢复', 'error');
+      text('#chat-request-status', state.chatStopping ? '已停止当前回答 · 文字和图片已恢复' : '请求未完成 · ' + error.message);
+      toast(state.chatStopping ? '已停止，文字和图片已恢复' : '请求未完成，文字和图片已恢复', state.chatStopping ? 'info' : 'error');
       scrollChat();
-    } finally { state.chatBusy = false; state.chatJob = null; updateActionAvailability(); }
+    } finally { window.clearInterval(progressTimer); state.chatBusy = false; state.chatJob = null; state.chatAbort = null; state.chatStopping = false; updateActionAvailability(); }
     if (inferenceCompleted) await refreshStatus();
   }
   async function showBootstrap() {
@@ -1318,7 +1455,7 @@ for chunk in response:
       const payload = await api('/api/bootstrap');
       const cfg = payload.config || {};
       const safeCfg = {};
-      ['public_url', 'server_url', 'backend', 'auto_load', 'llama_preset', 'llama_model_path', 'llama_mmproj_path', 'llama_server_path', 'llama_alias', 'llama_context_length', 'llama_kv_type', 'llama_batch_size', 'llama_ubatch_size', 'llama_tensor_split', 'context_length', 'model_path', 'strata_path', 'kv_type', 'low_ram', 'experimental_projection'].forEach(function (name) { if (cfg[name] !== undefined) safeCfg[name] = cfg[name]; });
+      ['public_url', 'server_url', 'backend', 'auto_load', 'llama_preset', 'llama_model_path', 'llama_mmproj_path', 'llama_server_path', 'llama_alias', 'llama_context_length', 'llama_parallel', 'llama_kv_type', 'llama_batch_size', 'llama_ubatch_size', 'llama_tensor_split', 'context_length', 'model_path', 'strata_path', 'kv_type', 'low_ram', 'experimental_projection'].forEach(function (name) { if (cfg[name] !== undefined) safeCfg[name] = cfg[name]; });
       const lines = [
         '接入 Notebook：' + (payload.notebook_url || '/api/notebook'),
         '代理脚本：' + (payload.agent_download_url || '/api/agent-download'),
@@ -1356,7 +1493,7 @@ for chunk in response:
     finally { state.pendingAuth = false; $('#auth-submit').disabled = false; }
   });
   $('#logout-button').addEventListener('click', async function () {
-    try { await api('/api/logout', { method: 'POST' }); hideNewKey(); state.history = []; state.chatImages = []; renderChatImages(); state.samples = []; state.status = null; state.runtime = null; state.runtimeBusy = false; state.requests = { summary: {}, rows: [] }; state.launches = { summary: {}, rows: [] }; state.quotas = null; showAuth(false); }
+    try { if (state.chatJob) await stopChat(); await api('/api/logout', { method: 'POST' }); hideNewKey(); state.history = []; state.chatImages = []; renderChatImages(); state.samples = []; state.status = null; state.runtime = null; state.runtimeBusy = false; state.requests = { summary: {}, rows: [] }; state.launches = { summary: {}, rows: [] }; state.quotas = null; showAuth(false); }
     catch (error) { toast(error.message, 'error'); }
   });
   $('#model-form').addEventListener('submit', function (event) { event.preventDefault(); saveSettings(event.currentTarget, '#model-save-status'); });
@@ -1390,6 +1527,7 @@ for chunk in response:
     });
   });
   $('#chat-form').addEventListener('submit', sendChat);
+  $('#chat-stop-button').addEventListener('click', stopChat);
   $('#chat-image-button').addEventListener('click', function () { if (!this.disabled) $('#chat-image-input').click(); });
   $('#chat-image-input').addEventListener('change', function () { addChatImages(this.files); });
   $('#chat-input').addEventListener('keydown', function (event) { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); if (!$('#chat-send-button').disabled) $('#chat-form').requestSubmit(); } });
